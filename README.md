@@ -1,6 +1,6 @@
 # bb-web
 
-仿造 `E:\B2` 功能的网页版实现，技术栈：
+技术栈：
 
 - Node.js 22+
 - TypeScript
