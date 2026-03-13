@@ -37,10 +37,19 @@ let touchDraggedAccountId = '';
 let touchDragChanged = false;
 let touchDragTimer = null;
 let touchDragReady = false;
+let visitorLogs = [];
+let visitorLogRetentionDays = 30;
+let visitorBlacklist = [];
+let visitorLogLimit = 100;
+let visitorBlockTargetIp = '';
+let visitorPathFilter = '';
+let visitorVisibleCount = 10;
+const VISITOR_LOG_BATCH_SIZE = 10;
 
 let eventSource = null;
 let importEventSource = null;
 let namePopupDismissBound = false;
+let visitorLogObserver = null;
 
 function getRedeemStatusView(account) {
   return redeemStatuses[account.accountId] ?? getDefaultRedeemStatus(account.status);
@@ -209,7 +218,7 @@ function closeImportEventSource() {
 
 function getRouteFromHash() {
   const hash = window.location.hash.replace('#', '');
-  if (hash === 'create' || hash === 'list' || hash === 'redeem') {
+  if (hash === 'create' || hash === 'list' || hash === 'redeem' || hash === 'visitors') {
     return hash;
   }
   return 'home';
@@ -217,6 +226,11 @@ function getRouteFromHash() {
 
 function navigate(route) {
   currentRoute = route;
+  if (route !== 'visitors') {
+    disconnectVisitorLogObserver();
+  } else {
+    visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
+  }
   window.location.hash = route === 'home' ? '' : route;
   void render();
 }
@@ -289,6 +303,17 @@ function renderHome() {
             <span class="home-card-label">批量兑换</span>
             <span class="home-card-meta">实时查看兑换状态与结果</span>
           </button>
+          ${
+            isAdminUser()
+              ? `
+          <button class="nav-card home-nav-card" data-route="visitors">
+            <span class="home-card-glow"></span>
+            <span class="home-card-label">访问记录</span>
+            <span class="home-card-meta">查看访客日志并维护拦截黑名单</span>
+          </button>
+          `
+              : ''
+          }
         </div>
       </div>
     </section>
@@ -474,6 +499,236 @@ function renderRedeemPage() {
   `);
 }
 
+function renderVisitorPage() {
+  const filteredVisitorLogs = visitorLogs.filter((item) =>
+    visitorPathFilter.trim() === '' ? true : (item.path || '').toLowerCase().includes(visitorPathFilter.trim().toLowerCase())
+  );
+  const visibleVisitorLogs = filteredVisitorLogs.slice(0, visitorVisibleCount);
+  const hasMoreVisitorLogs = visibleVisitorLogs.length < filteredVisitorLogs.length;
+  const blockModal = `
+    <div class="visitor-modal-backdrop" id="visitor-block-modal" ${visitorBlockTargetIp ? '' : 'hidden'}>
+      <div class="visitor-modal" role="dialog" aria-modal="true" aria-labelledby="visitor-block-title">
+        <div class="visitor-modal-head">
+          <h3 id="visitor-block-title">拉黑 IP</h3>
+        </div>
+        <div class="visitor-modal-body">
+          <div class="feedback" data-state="error">IP：${escapeHtml(visitorBlockTargetIp || '-')}</div>
+          <input
+            id="visitor-block-reason"
+            class="search-input visitor-block-reason-input"
+            type="text"
+            placeholder="输入拉黑理由，例如恶意扫描"
+          />
+        </div>
+        <div class="visitor-modal-actions">
+          <button class="danger-button" id="confirm-visitor-block">确认拉黑</button>
+          <button class="secondary-button" id="cancel-visitor-block">取消</button>
+        </div>
+      </div>
+    </div>
+  `;
+  const logRows =
+    visitorLogs.length === 0
+      ? '<div class="empty-state">最近还没有访问记录。</div>'
+      : filteredVisitorLogs.length === 0
+        ? '<div class="empty-state">没有匹配到对应路径的访问记录。</div>'
+      : `
+      <div class="table-wrap visitor-log-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>IP</th>
+              <th>请求</th>
+              <th>路径</th>
+              <th>参数</th>
+              <th>Body</th>
+              <th>状态</th>
+              <th>来源</th>
+              <th>账号</th>
+              <th>详情</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>${visibleVisitorLogs.map(visitorLogRowTemplate).join('')}</tbody>
+        </table>
+      </div>
+      ${
+        hasMoreVisitorLogs
+          ? `<div class="visitor-load-more" id="visitor-log-load-more">继续下滑加载更多记录</div>`
+          : `<div class="visitor-load-more visitor-load-more-end">已显示全部 ${filteredVisitorLogs.length} 条记录</div>`
+      }
+    `;
+  const blacklistRows =
+    visitorBlacklist.length === 0
+      ? '<div class="empty-state blacklist-empty">当前没有黑名单 IP。</div>'
+      : `
+      <div class="table-wrap blacklist-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>IP</th>
+              <th>原因</th>
+              <th>更新时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>${visitorBlacklist.map(blacklistRowTemplate).join('')}</tbody>
+        </table>
+      </div>
+    `;
+
+  return createShell(`
+    <section class="page-head">
+      <div>
+        <p class="lead">当前拉取最近 ${visitorLogLimit} 条访问记录，每次展示 ${VISITOR_LOG_BATCH_SIZE} 条，下滑自动继续加载。数据库会自动只保留最近 ${visitorLogRetentionDays} 天。</p>
+      </div>
+      <div class="page-actions">
+        <button class="secondary-button" id="refresh-visitor-logs">刷新访问记录</button>
+        <button class="danger-button" id="clear-visitor-logs">一键清空访问记录</button>
+      </div>
+    </section>
+    <section class="panel visitor-panel">
+      <div class="visitor-toolbar">
+        <input id="visitor-path-filter" class="search-input visitor-path-filter-input" type="text" placeholder="按访问路径搜索，例如 /api/auth" value="${escapeAttribute(visitorPathFilter)}" />
+        <button class="secondary-button toolbar-button" id="clear-visitor-path-filter">清空路径搜索</button>
+      </div>
+    </section>
+    <section class="panel visitor-panel">
+      <div class="visitor-toolbar">
+        <input id="blacklist-ip" class="search-input" type="text" placeholder="输入 IP 地址加入黑名单" />
+        <input id="blacklist-reason" class="search-input visitor-reason-input" type="text" placeholder="拉黑原因，例如恶意扫描" />
+        <button class="danger-button toolbar-button" id="add-blacklist-entry">加入黑名单</button>
+      </div>
+      ${blacklistRows}
+    </section>
+    <section class="panel visitor-panel">
+      ${logRows}
+    </section>
+    ${blockModal}
+  `);
+}
+
+function visitorLogRowTemplate(item) {
+  const requestLabel = `${item.method} ${item.path}`;
+  const accountLabel = item.username ? `${item.username} (${item.userRole || '-'})` : '-';
+  const sourceLabel = [item.host, item.cfCountry].filter(Boolean).join(' / ') || '-';
+  const queryLabel = item.query || '-';
+  const bodyLabel = item.body || '-';
+  const isBlacklisted = visitorBlacklist.some((entry) => entry.ipAddress === item.ipAddress);
+  const details = [
+    item.params ? `Params:\n${item.params}` : '',
+    item.headers ? `Headers:\n${item.headers}` : '',
+    item.blocked ? `Blocked:\n${item.blockReason || '是'}` : ''
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  return `
+    <tr>
+      <td data-label="时间">${escapeHtml(formatDateTime(item.createdAt))}</td>
+      <td data-label="IP">
+        <div class="visitor-ip-cell">
+          <span class="mono-text">${escapeHtml(item.ipAddress || '-')}</span>
+          <span class="visitor-user-agent">${escapeHtml(item.userAgent || '-')}</span>
+        </div>
+      </td>
+      <td data-label="请求">
+        <div class="visitor-request-cell">
+          <span class="mono-text">${escapeHtml(item.method)}</span>
+          <span class="visitor-request-meta">${escapeHtml(item.protocol.toUpperCase())} · ${escapeHtml(String(item.durationMs))}ms</span>
+        </div>
+      </td>
+      <td data-label="路径"><span class="mono-text visitor-path-text">${escapeHtml(item.path || requestLabel)}</span></td>
+      <td data-label="参数"><pre class="visitor-inline-pre">${escapeHtml(queryLabel)}</pre></td>
+      <td data-label="Body"><pre class="visitor-inline-pre">${escapeHtml(bodyLabel)}</pre></td>
+      <td data-label="状态">
+        <span class="status-badge ${item.blocked ? 'status-blocked' : item.statusCode >= 400 ? 'status-2' : 'status-1'}">${escapeHtml(
+          item.blocked ? `拦截 ${item.statusCode}` : String(item.statusCode)
+        )}</span>
+      </td>
+      <td data-label="来源">${escapeHtml(sourceLabel)}</td>
+      <td data-label="账号">${escapeHtml(accountLabel)}</td>
+      <td data-label="详情">
+        <details class="visitor-details">
+          <summary>查看</summary>
+          <pre>${escapeHtml(details || '无更多详情')}</pre>
+        </details>
+      </td>
+      <td data-label="操作">
+        ${
+          item.ipAddress && !isBlacklisted
+            ? `<button class="danger-button" data-block-ip="${escapeAttribute(item.ipAddress)}">拉黑</button>`
+            : `<span class="visitor-action-placeholder">${isBlacklisted ? '已拉黑' : '-'}</span>`
+        }
+      </td>
+    </tr>
+  `;
+}
+
+function blacklistRowTemplate(item) {
+  return `
+    <tr>
+      <td data-label="IP"><span class="mono-text">${escapeHtml(item.ipAddress)}</span></td>
+      <td data-label="原因">${escapeHtml(item.reason || '-')}</td>
+      <td data-label="更新时间">${escapeHtml(formatDateTime(item.updatedAt))}</td>
+      <td data-label="操作">
+        <button class="secondary-button" data-unblock-ip="${escapeAttribute(item.ipAddress)}">移除黑名单</button>
+      </td>
+    </tr>
+  `;
+}
+
+function disconnectVisitorLogObserver() {
+  if (visitorLogObserver) {
+    visitorLogObserver.disconnect();
+    visitorLogObserver = null;
+  }
+}
+
+function setupVisitorLogObserver() {
+  disconnectVisitorLogObserver();
+
+  if (currentRoute !== 'visitors') {
+    return;
+  }
+
+  const loadMoreElement = document.querySelector('#visitor-log-load-more');
+  if (!loadMoreElement) {
+    return;
+  }
+
+  visitorLogObserver = new IntersectionObserver(
+    (entries) => {
+      const [entry] = entries;
+      if (!entry?.isIntersecting) {
+        return;
+      }
+
+      visitorVisibleCount += VISITOR_LOG_BATCH_SIZE;
+      disconnectVisitorLogObserver();
+      void render();
+    },
+    {
+      root: null,
+      rootMargin: '120px 0px',
+      threshold: 0.1
+    }
+  );
+
+  visitorLogObserver.observe(loadMoreElement);
+}
+
+function openVisitorBlockModal(ipAddress) {
+  visitorBlockTargetIp = ipAddress;
+  void render();
+}
+
+function closeVisitorBlockModal() {
+  visitorBlockTargetIp = '';
+  void render();
+}
+
 function redeemAccountRowTemplate(account) {
   const gameAvatar = account.details?.avatar_image?.trim() || '';
   const gameName = account.name?.trim() || account.accountId;
@@ -515,8 +770,24 @@ async function render() {
     redeemConfigLoaded = true;
   }
 
+  if (currentRoute === 'visitors' && !isAdminUser()) {
+    currentRoute = 'home';
+    window.location.hash = '';
+  }
+
   if (currentRoute === 'redeem') {
     redeemAccounts = await api('/api/accounts');
+  }
+
+  if (currentRoute === 'visitors' && isAdminUser()) {
+    const [logResult, blacklistResult] = await Promise.all([
+      api(`/api/visitor-logs?limit=${visitorLogLimit}`),
+      api('/api/visitor-blacklist')
+    ]);
+    visitorLogs = logResult.items || [];
+    visitorLogRetentionDays = logResult.retentionDays || 30;
+    visitorBlacklist = blacklistResult || [];
+    visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
   }
 
   if (currentRoute === 'home') {
@@ -525,11 +796,14 @@ async function render() {
     app.innerHTML = renderCreatePage();
   } else if (currentRoute === 'list') {
     app.innerHTML = await renderListPage();
+  } else if (currentRoute === 'visitors' && isAdminUser()) {
+    app.innerHTML = renderVisitorPage();
   } else {
     app.innerHTML = renderRedeemPage();
   }
 
   bindEvents();
+  setupVisitorLogObserver();
 }
 
 function bindEvents() {
@@ -617,6 +891,11 @@ function bindEvents() {
       redeemConfigLoaded = false;
       redeemAccounts = [];
       redeemStatuses = {};
+      visitorLogs = [];
+      visitorBlacklist = [];
+      visitorPathFilter = '';
+      visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
+      disconnectVisitorLogObserver();
       closeEventSource();
       closeImportEventSource();
       void render();
@@ -666,6 +945,108 @@ function bindEvents() {
 
   const refreshButton = document.querySelector('#refresh-accounts');
   refreshButton?.addEventListener('click', () => void render());
+
+  const refreshVisitorLogsButton = document.querySelector('#refresh-visitor-logs');
+  refreshVisitorLogsButton?.addEventListener('click', () => void render());
+
+  const clearVisitorLogsButton = document.querySelector('#clear-visitor-logs');
+  clearVisitorLogsButton?.addEventListener('click', async () => {
+    if (!window.confirm('确定要清空全部访问记录吗？此操作不可恢复。')) {
+      return;
+    }
+
+    clearVisitorLogsButton.disabled = true;
+    try {
+      await api('/api/visitor-logs', { method: 'DELETE' });
+      visitorLogs = [];
+      visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
+      disconnectVisitorLogObserver();
+      void render();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '清空访问记录失败');
+      clearVisitorLogsButton.disabled = false;
+    }
+  });
+
+  const visitorPathFilterInput = document.querySelector('#visitor-path-filter');
+  visitorPathFilterInput?.addEventListener('input', () => {
+    visitorPathFilter = visitorPathFilterInput.value ?? '';
+    visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
+    void render();
+  });
+
+  const clearVisitorPathFilterButton = document.querySelector('#clear-visitor-path-filter');
+  clearVisitorPathFilterButton?.addEventListener('click', () => {
+    visitorPathFilter = '';
+    visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
+    void render();
+  });
+
+  const addBlacklistEntryButton = document.querySelector('#add-blacklist-entry');
+  addBlacklistEntryButton?.addEventListener('click', async () => {
+    const ipInput = document.querySelector('#blacklist-ip');
+    const reasonInput = document.querySelector('#blacklist-reason');
+    const ipAddress = ipInput?.value.trim() ?? '';
+    const reason = reasonInput?.value.trim() ?? '';
+
+    if (!ipAddress) {
+      window.alert('请输入要拉黑的 IP 地址。');
+      return;
+    }
+
+    addBlacklistEntryButton.disabled = true;
+    try {
+      await api('/api/visitor-blacklist', {
+        method: 'POST',
+        body: JSON.stringify({ ipAddress, reason })
+      });
+      if (ipInput) {
+        ipInput.value = '';
+      }
+      if (reasonInput) {
+        reasonInput.value = '';
+      }
+      void render();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '拉黑失败');
+    } finally {
+      addBlacklistEntryButton.disabled = false;
+    }
+  });
+
+  const visitorBlockModal = document.querySelector('#visitor-block-modal');
+  visitorBlockModal?.addEventListener('click', (event) => {
+    if (event.target === visitorBlockModal) {
+      closeVisitorBlockModal();
+    }
+  });
+
+  const cancelVisitorBlockButton = document.querySelector('#cancel-visitor-block');
+  cancelVisitorBlockButton?.addEventListener('click', () => {
+    closeVisitorBlockModal();
+  });
+
+  const confirmVisitorBlockButton = document.querySelector('#confirm-visitor-block');
+  confirmVisitorBlockButton?.addEventListener('click', async () => {
+    if (!visitorBlockTargetIp) {
+      return;
+    }
+
+    const reasonInput = document.querySelector('#visitor-block-reason');
+    const reason = reasonInput?.value.trim() ?? '';
+    confirmVisitorBlockButton.disabled = true;
+    try {
+      await api('/api/visitor-blacklist', {
+        method: 'POST',
+        body: JSON.stringify({ ipAddress: visitorBlockTargetIp, reason })
+      });
+      visitorBlockTargetIp = '';
+      void render();
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '拉黑失败');
+      confirmVisitorBlockButton.disabled = false;
+    }
+  });
 
   const deleteAllButton = document.querySelector('#delete-all-accounts');
   deleteAllButton?.addEventListener('click', async () => {
@@ -1133,6 +1514,37 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll('[data-block-ip]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const ipAddress = button.dataset.blockIp;
+      if (!ipAddress) {
+        return;
+      }
+      openVisitorBlockModal(ipAddress);
+    });
+  });
+
+  document.querySelectorAll('[data-unblock-ip]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const ipAddress = button.dataset.unblockIp;
+      if (!ipAddress) {
+        return;
+      }
+
+      button.disabled = true;
+      try {
+        await api(`/api/visitor-blacklist/${encodeURIComponent(ipAddress)}`, {
+          method: 'DELETE'
+        });
+        void render();
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : '解除失败');
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
   document.querySelectorAll('.avatar-image').forEach((image) => {
     image.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -1378,6 +1790,20 @@ function updateLocalAccountStatus(accountId, status) {
   if (account) {
     account.status = status;
   }
+}
+
+function formatDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '-';
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
 function showFeedback(target, message, isError) {

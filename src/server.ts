@@ -4,13 +4,21 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  cleanupVisitorLogs,
   createAccountsBatch,
+  createVisitorLog,
+  deleteAllVisitorLogs,
   deleteAccount,
   deleteAllAccounts,
+  deleteBlacklistEntry,
+  getBlacklistEntry,
   getDb,
   getExistingAccountIds,
   listAccounts,
-  reorderAccounts
+  listBlacklistEntries,
+  listVisitorLogs,
+  reorderAccounts,
+  upsertBlacklistEntry
 } from './db.js';
 import { getRedeemConfig, setRedeemToken } from './config.js';
 import { fetchPlayerProfile, waitForNextAccount } from './player.js';
@@ -26,14 +34,86 @@ type SessionRecord = { username: string; role: UserRole; expiresAt: number };
 const sessions = new Map<string, SessionRecord>();
 const SESSION_COOKIE_NAME = 'bbwg_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const VISITOR_LOG_RETENTION_DAYS = 30;
+const VISITOR_LOG_CLEANUP_INTERVAL_MS = 1000 * 60 * 60 * 24;
 const adminUsername = process.env.ADMIN_USERNAME?.trim() || '';
 const adminPassword = process.env.ADMIN_PASSWORD?.trim() || '';
 const tempUsername = process.env.TEMP_USERNAME?.trim() || '';
 const tempPassword = process.env.TEMP_PASSWORD?.trim() || '';
 const sessionSecret = process.env.SESSION_SECRET?.trim() || 'bbwg-dev-session-secret';
 
+app.set('trust proxy', true);
 app.use(express.json());
-app.use(express.static(path.resolve(__dirname, '../public')));
+
+function normalizeIpAddress(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (trimmed.startsWith('::ffff:')) {
+    return trimmed.slice(7);
+  }
+  return trimmed;
+}
+
+function getClientIp(req: express.Request): string {
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const forwardedIp = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor?.split(',')[0]?.trim();
+  const cloudflareIp = typeof req.headers['cf-connecting-ip'] === 'string' ? req.headers['cf-connecting-ip'] : '';
+  return normalizeIpAddress(cloudflareIp || forwardedIp || req.ip || '');
+}
+
+function getRequestProtocol(req: express.Request): string {
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  if (Array.isArray(forwardedProto)) {
+    return forwardedProto[0] || req.protocol;
+  }
+  return forwardedProto || req.protocol;
+}
+
+function getRequestHost(req: express.Request): string {
+  const forwardedHost = req.headers['x-forwarded-host'];
+  if (Array.isArray(forwardedHost)) {
+    return forwardedHost[0] || req.get('host') || '';
+  }
+  return forwardedHost || req.get('host') || '';
+}
+
+function stringifyForLog(value: unknown, maxLength = 16_000): string {
+  if (value === undefined) {
+    return '';
+  }
+
+  try {
+    const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+    return serialized.length > maxLength ? `${serialized.slice(0, maxLength)}...[truncated]` : serialized;
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+function shouldAuditRequest(req: express.Request): boolean {
+  const requestPath = req.path || '';
+  const staticAssetPattern =
+    /^\/(?:app\.js|style\.css|favicon\.ico|manifest\.json|robots\.txt|apple-touch-icon.*|.*\.(?:js|css|map|png|jpg|jpeg|gif|svg|webp|ico|txt|woff|woff2))$/i;
+  const auditExcludedPaths = new Set([
+    '/',
+    '/api/auth/status',
+    '/api/config/redeem',
+    '/api/visitor-logs',
+    '/api/visitor-blacklist'
+  ]);
+
+  if (staticAssetPattern.test(requestPath)) {
+    return false;
+  }
+
+  if (auditExcludedPaths.has(requestPath) || requestPath.startsWith('/api/visitor-blacklist/')) {
+    return false;
+  }
+
+  return true;
+}
 
 function parseCookies(cookieHeader?: string): Record<string, string> {
   if (!cookieHeader) {
@@ -196,6 +276,70 @@ function broadcastImportProgress(payload: {
   }
 }
 
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  const shouldAudit = shouldAuditRequest(req);
+
+  res.on('finish', () => {
+    if (!shouldAudit) {
+      return;
+    }
+
+    const session = getSessionFromRequest(req);
+    void createVisitorLog({
+      ipAddress: getClientIp(req),
+      method: req.method,
+      protocol: getRequestProtocol(req),
+      host: getRequestHost(req),
+      path: req.path,
+      query: stringifyForLog(req.query),
+      params: stringifyForLog(req.params),
+      headers: stringifyForLog(req.headers),
+      body: stringifyForLog(req.body),
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAt,
+      username: session?.username ?? '',
+      userRole: session?.role ?? '',
+      userAgent: req.get('user-agent') || '',
+      referer: req.get('referer') || '',
+      cfRay: req.get('cf-ray') || '',
+      cfCountry: req.get('cf-ipcountry') || '',
+      blocked: Boolean(res.locals.auditBlocked),
+      blockReason: typeof res.locals.auditBlockReason === 'string' ? res.locals.auditBlockReason : '',
+      createdAt: Date.now()
+    }).catch((error: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error('failed to persist visitor log', error);
+    });
+  });
+
+  next();
+});
+
+app.use(async (req, res, next) => {
+  try {
+    const ipAddress = getClientIp(req);
+    if (!ipAddress) {
+      next();
+      return;
+    }
+
+    const blacklistEntry = await getBlacklistEntry(ipAddress);
+    if (!blacklistEntry) {
+      next();
+      return;
+    }
+
+    res.locals.auditBlocked = true;
+    res.locals.auditBlockReason = blacklistEntry.reason || '命中访问黑名单';
+    res.status(404).send('Not Found');
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.use(express.static(path.resolve(__dirname, '../public')));
+
 redeemService.on('progress', (payload: RedeemProgressPayload) => {
   broadcastRedeemProgress(payload);
 });
@@ -303,7 +447,9 @@ app.get('/api/accounts/import-events', requireAuth, (_req, res) => {
 app.post('/api/accounts/batch', requireAuth, async (req, res) => {
   try {
     const { accountIds } = req.body as { accountIds?: string[] };
-    const normalizedIds = Array.from(new Set((Array.isArray(accountIds) ? accountIds : []).map((item) => item.trim()).filter(Boolean)));
+    const normalizedIds = Array.from(
+      new Set((Array.isArray(accountIds) ? accountIds : []).map((item) => item.trim()).filter(Boolean))
+    );
     const existingIds = await getExistingAccountIds(normalizedIds);
     const newIds = normalizedIds.filter((accountId) => !existingIds.has(accountId));
     const accountsToInsert: Array<{ accountId: string; name: string; details: Record<string, unknown> }> = [];
@@ -462,6 +608,69 @@ app.post('/api/config/redeem-token', requireRole('admin'), (req, res) => {
   }
 });
 
+app.get('/api/visitor-logs', requireRole('admin'), async (req, res) => {
+  try {
+    const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+    const parsedLimit = Number(rawLimit);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 100;
+    const rows = await listVisitorLogs(limit);
+    res.json({
+      retentionDays: VISITOR_LOG_RETENTION_DAYS,
+      items: rows
+    });
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.delete('/api/visitor-logs', requireRole('admin'), async (_req, res) => {
+  try {
+    const deleted = await deleteAllVisitorLogs();
+    res.json({ ok: true, deleted });
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.get('/api/visitor-blacklist', requireRole('admin'), async (_req, res) => {
+  try {
+    const items = await listBlacklistEntries();
+    res.json(items);
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.post('/api/visitor-blacklist', requireRole('admin'), async (req, res) => {
+  try {
+    const { ipAddress, reason } = req.body as { ipAddress?: string; reason?: string };
+    const normalizedIpAddress = normalizeIpAddress(ipAddress ?? '');
+    const normalizedReason = reason?.trim() ?? '';
+
+    if (!normalizedIpAddress) {
+      sendJsonError(res, new Error('请输入要拉黑的 IP 地址。'), 400);
+      return;
+    }
+
+    await upsertBlacklistEntry(normalizedIpAddress, normalizedReason);
+    res.json({ ok: true });
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.delete('/api/visitor-blacklist/:ipAddress', requireRole('admin'), async (req, res) => {
+  try {
+    const ipAddress = normalizeIpAddress(
+      Array.isArray(req.params.ipAddress) ? req.params.ipAddress[0] : req.params.ipAddress
+    );
+    await deleteBlacklistEntry(ipAddress);
+    res.json({ ok: true });
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
 app.get('*', (_req, res) => {
   res.sendFile(path.resolve(__dirname, '../public/index.html'));
 });
@@ -469,6 +678,17 @@ app.get('*', (_req, res) => {
 const port = Number(process.env.PORT || 3458);
 
 void getDb().then(() => {
+  void cleanupVisitorLogs(VISITOR_LOG_RETENTION_DAYS).catch((error: unknown) => {
+    // eslint-disable-next-line no-console
+    console.error('failed to cleanup visitor logs on startup', error);
+  });
+  setInterval(() => {
+    void cleanupVisitorLogs(VISITOR_LOG_RETENTION_DAYS).catch((error: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error('failed to cleanup visitor logs', error);
+    });
+  }, VISITOR_LOG_CLEANUP_INTERVAL_MS);
+
   app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(`bb-web is running at http://localhost:${port}`);
