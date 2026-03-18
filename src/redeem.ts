@@ -5,6 +5,7 @@ import {
   countAccountsByStatus,
   forceSetAllAccountsRedeemed,
   listAccountsByIds,
+  listAccountsByIdsIncludingDeleted,
   listAccountsByStatus,
   resetAccountsStatus,
   updateAccountProfile,
@@ -228,6 +229,16 @@ export class RedeemService extends EventEmitter {
           this.ensureNotCancelled();
           const displayName = account.name?.trim() || '未命名账号';
           try {
+            const [latestAccount] = await listAccountsByIdsIncludingDeleted([account.accountId], { includeBlacklisted: true });
+            if (!latestAccount || latestAccount.deleted) {
+              this.log('warn', `已跳过已删除账号: ${displayName} (${account.accountId})`);
+              continue;
+            }
+            if (latestAccount.blacklisted) {
+              this.log('warn', `已跳过黑名单账号: ${displayName} (${account.accountId})`);
+              continue;
+            }
+
             this.log('info', `开始处理: ${displayName} (${account.accountId})`);
             this.activeController = new AbortController();
 

@@ -3,3 +3,5 @@ dist
 data
 config.json
 .env
+tmp-*.png
+dev-server*.log

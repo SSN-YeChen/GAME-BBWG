@@ -326,9 +326,42 @@ button {
   margin-bottom: 20px;
 }
 
+.page-head-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .page-actions {
   display: flex;
   gap: 12px;
+}
+
+.list-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.list-summary-label {
+  font-size: 14px;
+  color: #5e6b80;
+}
+
+.list-summary-value {
+  font-size: 28px;
+  line-height: 1;
+  color: #14213d;
+}
+
+.list-summary-meta {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(53, 80, 112, 0.08);
+  color: #355070;
+  font-size: 13px;
 }
 
 .list-toolbar {
@@ -918,12 +951,22 @@ tbody tr:hover {
   justify-content: center;
 }
 
-.blacklist-wrap [data-unblock-ip] {
+.blacklist-wrap [data-unblock-ip],
+.blacklist-wrap [data-unblacklist-account] {
   min-width: 132px;
 }
 
 .table-actions {
-  width: 92px;
+  width: 200px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.table-actions .secondary-button,
+.table-actions .danger-button {
+  min-width: 88px;
+  justify-content: center;
 }
 
 .empty-state {
@@ -1128,7 +1171,115 @@ tbody tr:hover {
     text-transform: uppercase;
   }
 
-  .blacklist-wrap [data-unblock-ip] {
+  .blacklist-wrap [data-unblock-ip],
+  .blacklist-wrap [data-unblacklist-account] {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .list-page-head {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+  }
+
+  .list-page-head .page-head-main,
+  .list-page-head .list-toolbar,
+  .list-page-head .list-page-actions {
+    display: contents;
+  }
+
+  .list-page-head .list-summary,
+  .list-page-head #search-account-id,
+  .list-page-head #search-game-name,
+  .list-page-head #view-account-blacklist,
+  .list-page-head #delete-all-accounts {
+    grid-column: 1 / -1;
+  }
+
+  .list-page-head #apply-search,
+  .list-page-head #clear-search,
+  .list-page-head #refresh-accounts {
+    min-width: 0;
+  }
+
+  .account-list-wrap {
+    overflow: visible;
+    border: 0;
+    box-shadow: none;
+    background: transparent;
+  }
+
+  .account-list-wrap table,
+  .account-list-wrap thead,
+  .account-list-wrap tbody,
+  .account-list-wrap tr,
+  .account-list-wrap th,
+  .account-list-wrap td {
+    display: block;
+    width: 100%;
+  }
+
+  .account-list-wrap table {
+    min-width: 0;
+  }
+
+  .account-list-wrap thead {
+    display: none;
+  }
+
+  .account-list-wrap tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .account-list-wrap tr {
+    border-radius: 18px;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.52);
+    border: 1px solid rgba(20, 33, 61, 0.08);
+    box-shadow: 0 10px 24px rgba(20, 33, 61, 0.08);
+  }
+
+  .account-list-wrap td {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+    padding: 8px 0;
+    font-size: 12px;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    border-bottom: 1px solid rgba(20, 33, 61, 0.06);
+  }
+
+  .account-list-wrap td:last-child {
+    border-bottom: 0;
+  }
+
+  .account-list-wrap td::before {
+    content: attr(data-label);
+    color: #526079;
+    font-size: 11px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  .account-list-wrap .sort-trigger-button,
+  .account-list-wrap .name-preview-button {
+    width: 100%;
+  }
+
+  .account-list-wrap .table-actions {
+    width: 100%;
+    display: grid;
+    gap: 8px;
+  }
+
+  .account-list-wrap .table-actions .secondary-button,
+  .account-list-wrap .table-actions .danger-button {
+    grid-column: 2;
     width: 100%;
     min-width: 0;
   }
@@ -1248,6 +1399,7 @@ tbody tr:hover {
     width: auto;
   }
 
+  .table-actions .secondary-button,
   .table-actions .danger-button {
     width: 100%;
     padding: 7px 6px;

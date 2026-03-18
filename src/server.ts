@@ -15,9 +15,11 @@ import {
   getDb,
   getExistingAccountIds,
   listAccounts,
+  listBlacklistedAccounts,
   listBlacklistEntries,
   listVisitorLogs,
   reorderAccounts,
+  setAccountBlacklist,
   upsertBlacklistEntry
 } from './db.js';
 import { getRedeemConfig, setRedeemToken } from './config.js';
@@ -518,6 +520,43 @@ app.get('/api/accounts', requireAuth, async (_req, res) => {
   try {
     const rows = await listAccounts();
     res.json(rows);
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.get('/api/accounts/blacklist', requireRole('admin'), async (_req, res) => {
+  try {
+    const rows = await listBlacklistedAccounts();
+    res.json(rows);
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.post('/api/accounts/:accountId/blacklist', requireRole('admin'), async (req, res) => {
+  try {
+    const accountId = Array.isArray(req.params.accountId) ? req.params.accountId[0] : req.params.accountId;
+    const updated = await setAccountBlacklist(accountId, true);
+    if (!updated) {
+      sendJsonError(res, new Error('账号不存在'), 404);
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.delete('/api/accounts/:accountId/blacklist', requireRole('admin'), async (req, res) => {
+  try {
+    const accountId = Array.isArray(req.params.accountId) ? req.params.accountId[0] : req.params.accountId;
+    const updated = await setAccountBlacklist(accountId, false);
+    if (!updated) {
+      sendJsonError(res, new Error('账号不存在'), 404);
+      return;
+    }
+    res.json({ ok: true });
   } catch (error) {
     sendJsonError(res, error);
   }

@@ -15,6 +15,8 @@ export interface AccountRow {
   accountId: string;
   name: string;
   status: AccountStatus;
+  blacklisted: boolean;
+  deleted: boolean;
   details: Record<string, unknown>;
   sortOrder: number;
   createdAt: number;
@@ -75,6 +77,8 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
       account_id TEXT PRIMARY KEY,
       name TEXT NOT NULL DEFAULT '',
       status INTEGER NOT NULL DEFAULT 0,
+      is_blacklisted INTEGER NOT NULL DEFAULT 0,
+      is_deleted INTEGER NOT NULL DEFAULT 0,
       details TEXT NOT NULL DEFAULT '{}',
       sort_order INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
@@ -141,6 +145,14 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
   if (!hasSortOrder) {
     await db.exec('ALTER TABLE accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0');
   }
+  const hasBlacklisted = columns.some((column) => column.name === 'is_blacklisted');
+  if (!hasBlacklisted) {
+    await db.exec('ALTER TABLE accounts ADD COLUMN is_blacklisted INTEGER NOT NULL DEFAULT 0');
+  }
+  const hasDeleted = columns.some((column) => column.name === 'is_deleted');
+  if (!hasDeleted) {
+    await db.exec('ALTER TABLE accounts ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0');
+  }
 
   const sortStats = await db.get<{ zeroCount: number; maxSortOrder: number }>(
     'SELECT COUNT(*) FILTER (WHERE sort_order = 0) as zeroCount, COALESCE(MAX(sort_order), 0) as maxSortOrder FROM accounts'
@@ -179,6 +191,8 @@ function toAccountRow(row: {
   account_id: string;
   name: string;
   status: number;
+  is_blacklisted: number;
+  is_deleted: number;
   details: string;
   sort_order: number;
   created_at: number;
@@ -195,6 +209,8 @@ function toAccountRow(row: {
     accountId: row.account_id,
     name: row.name,
     status: row.status as AccountStatus,
+    blacklisted: row.is_blacklisted === 1,
+    deleted: row.is_deleted === 1,
     details,
     sortOrder: row.sort_order,
     createdAt: row.created_at,
@@ -216,7 +232,7 @@ export async function getExistingAccountIds(accountIds: string[]): Promise<Set<s
   const db = await getDb();
   const placeholders = normalized.map(() => '?').join(',');
   const existing = await db.all<{ account_id: string }[]>(
-    `SELECT account_id FROM accounts WHERE account_id IN (${placeholders})`,
+    `SELECT account_id FROM accounts WHERE account_id IN (${placeholders}) AND is_deleted = 0`,
     normalized
   );
 
@@ -244,11 +260,41 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
   await db.exec('BEGIN');
   try {
     let nextSortOrder = await getNextSortOrder(db);
+    const existingRows = await db.all<{ account_id: string; is_deleted: number }[]>(
+      `SELECT account_id, is_deleted FROM accounts WHERE account_id IN (${normalized.map(() => '?').join(',')})`,
+      normalized.map((account) => account.accountId)
+    );
+    const existingMap = new Map(existingRows.map((row) => [row.account_id, row]));
+    let inserted = 0;
+
     for (const account of normalized) {
       const now = Date.now();
+      const existing = existingMap.get(account.accountId);
+
+      if (existing?.is_deleted === 1) {
+        await db.run(
+          `UPDATE accounts
+           SET name = ?, status = ?, is_blacklisted = 0, is_deleted = 0, details = ?, sort_order = ?, updated_at = ?
+           WHERE account_id = ?`,
+          account.name,
+          ACCOUNT_STATUS.pending,
+          JSON.stringify(account.details),
+          nextSortOrder,
+          now,
+          account.accountId
+        );
+        nextSortOrder += 1;
+        inserted += 1;
+        continue;
+      }
+
+      if (existing) {
+        continue;
+      }
+
       await db.run(
-        `INSERT INTO accounts (account_id, name, status, details, sort_order, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO accounts (account_id, name, status, is_blacklisted, is_deleted, details, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)`,
         account.accountId,
         account.name,
         ACCOUNT_STATUS.pending,
@@ -258,16 +304,17 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
         now
       );
       nextSortOrder += 1;
+      inserted += 1;
     }
     await db.exec('COMMIT');
+
+    return {
+      inserted
+    };
   } catch (error) {
     await db.exec('ROLLBACK');
     throw error;
   }
-
-  return {
-    inserted: normalized.length
-  };
 }
 
 export async function listAccounts(): Promise<AccountRow[]> {
@@ -277,12 +324,32 @@ export async function listAccounts(): Promise<AccountRow[]> {
       account_id: string;
       name: string;
       status: number;
+      is_blacklisted: number;
+      is_deleted: number;
       details: string;
       sort_order: number;
       created_at: number;
       updated_at: number;
     }[]
-  >('SELECT * FROM accounts ORDER BY sort_order ASC, created_at ASC');
+  >('SELECT * FROM accounts WHERE is_blacklisted = 0 AND is_deleted = 0 ORDER BY sort_order ASC, created_at ASC');
+  return rows.map(toAccountRow);
+}
+
+export async function listBlacklistedAccounts(): Promise<AccountRow[]> {
+  const db = await getDb();
+  const rows = await db.all<
+    {
+      account_id: string;
+      name: string;
+      status: number;
+      is_blacklisted: number;
+      is_deleted: number;
+      details: string;
+      sort_order: number;
+      created_at: number;
+      updated_at: number;
+    }[]
+  >('SELECT * FROM accounts WHERE is_blacklisted = 1 AND is_deleted = 0 ORDER BY updated_at DESC, sort_order ASC, created_at ASC');
   return rows.map(toAccountRow);
 }
 
@@ -293,33 +360,79 @@ export async function listAccountsByStatus(status: AccountStatus): Promise<Accou
       account_id: string;
       name: string;
       status: number;
+      is_blacklisted: number;
+      is_deleted: number;
       details: string;
       sort_order: number;
       created_at: number;
       updated_at: number;
     }[]
-  >('SELECT * FROM accounts WHERE status = ? ORDER BY sort_order ASC, created_at ASC', status);
+  >(
+    'SELECT * FROM accounts WHERE status = ? AND is_blacklisted = 0 AND is_deleted = 0 ORDER BY sort_order ASC, created_at ASC',
+    status
+  );
   return rows.map(toAccountRow);
 }
 
-export async function listAccountsByIds(accountIds: string[]): Promise<AccountRow[]> {
+export async function listAccountsByIds(accountIds: string[], options?: { includeBlacklisted?: boolean }): Promise<AccountRow[]> {
   if (accountIds.length === 0) {
     return [];
   }
 
   const db = await getDb();
   const placeholders = accountIds.map(() => '?').join(',');
+  const includeBlacklisted = options?.includeBlacklisted ?? false;
   const rows = await db.all<
     {
       account_id: string;
       name: string;
       status: number;
+      is_blacklisted: number;
+      is_deleted: number;
       details: string;
       sort_order: number;
       created_at: number;
       updated_at: number;
     }[]
-  >(`SELECT * FROM accounts WHERE account_id IN (${placeholders}) ORDER BY sort_order ASC, created_at ASC`, accountIds);
+  >(
+    `SELECT * FROM accounts WHERE account_id IN (${placeholders})${
+      includeBlacklisted ? '' : ' AND is_blacklisted = 0'
+    } AND is_deleted = 0 ORDER BY sort_order ASC, created_at ASC`,
+    accountIds
+  );
+
+  return rows.map(toAccountRow);
+}
+
+export async function listAccountsByIdsIncludingDeleted(
+  accountIds: string[],
+  options?: { includeBlacklisted?: boolean }
+): Promise<AccountRow[]> {
+  if (accountIds.length === 0) {
+    return [];
+  }
+
+  const db = await getDb();
+  const placeholders = accountIds.map(() => '?').join(',');
+  const includeBlacklisted = options?.includeBlacklisted ?? false;
+  const rows = await db.all<
+    {
+      account_id: string;
+      name: string;
+      status: number;
+      is_blacklisted: number;
+      is_deleted: number;
+      details: string;
+      sort_order: number;
+      created_at: number;
+      updated_at: number;
+    }[]
+  >(
+    `SELECT * FROM accounts WHERE account_id IN (${placeholders})${
+      includeBlacklisted ? '' : ' AND is_blacklisted = 0'
+    } ORDER BY sort_order ASC, created_at ASC`,
+    accountIds
+  );
 
   return rows.map(toAccountRow);
 }
@@ -336,7 +449,7 @@ export async function reorderAccounts(accountIds: string[]): Promise<void> {
     const now = Date.now();
     for (let index = 0; index < normalized.length; index += 1) {
       await db.run(
-        'UPDATE accounts SET sort_order = ?, updated_at = ? WHERE account_id = ?',
+        'UPDATE accounts SET sort_order = ?, updated_at = ? WHERE account_id = ? AND is_deleted = 0',
         index + 1,
         now,
         normalized[index]
@@ -351,14 +464,17 @@ export async function reorderAccounts(accountIds: string[]): Promise<void> {
 
 export async function countAccountsByStatus(status: AccountStatus): Promise<number> {
   const db = await getDb();
-  const row = await db.get<{ value: number }>('SELECT COUNT(*) as value FROM accounts WHERE status = ?', status);
+  const row = await db.get<{ value: number }>(
+    'SELECT COUNT(*) as value FROM accounts WHERE status = ? AND is_blacklisted = 0 AND is_deleted = 0',
+    status
+  );
   return row?.value ?? 0;
 }
 
 export async function resetAccountsStatus(from: AccountStatus, to: AccountStatus): Promise<number> {
   const db = await getDb();
   const result = await db.run(
-    'UPDATE accounts SET status = ?, updated_at = ? WHERE status = ?',
+    'UPDATE accounts SET status = ?, updated_at = ? WHERE status = ? AND is_blacklisted = 0 AND is_deleted = 0',
     to,
     Date.now(),
     from
@@ -393,21 +509,39 @@ export async function updateAccountStatus(accountId: string, status: AccountStat
 export async function forceSetAllAccountsRedeemed(): Promise<number> {
   const db = await getDb();
   const result = await db.run(
-    'UPDATE accounts SET status = ?, updated_at = ?',
+    'UPDATE accounts SET status = ?, updated_at = ? WHERE is_blacklisted = 0 AND is_deleted = 0',
     ACCOUNT_STATUS.redeemed,
     Date.now()
   );
   return result.changes ?? 0;
 }
 
+export async function setAccountBlacklist(accountId: string, blacklisted: boolean): Promise<boolean> {
+  const db = await getDb();
+  const result = await db.run(
+    'UPDATE accounts SET is_blacklisted = ?, updated_at = ? WHERE account_id = ? AND is_deleted = 0',
+    blacklisted ? 1 : 0,
+    Date.now(),
+    accountId
+  );
+  return (result.changes ?? 0) > 0;
+}
+
 export async function deleteAccount(accountId: string): Promise<void> {
   const db = await getDb();
-  await db.run('DELETE FROM accounts WHERE account_id = ?', accountId);
+  await db.run(
+    'UPDATE accounts SET is_deleted = 1, is_blacklisted = 0, updated_at = ? WHERE account_id = ? AND is_deleted = 0',
+    Date.now(),
+    accountId
+  );
 }
 
 export async function deleteAllAccounts(): Promise<number> {
   const db = await getDb();
-  const result = await db.run('DELETE FROM accounts');
+  const result = await db.run(
+    'UPDATE accounts SET is_deleted = 1, is_blacklisted = 0, updated_at = ? WHERE is_deleted = 0',
+    Date.now()
+  );
   return result.changes ?? 0;
 }
 

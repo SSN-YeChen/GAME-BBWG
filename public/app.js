@@ -32,6 +32,8 @@ let redeemConfigLoaded = false;
 let redeemAccounts = [];
 let redeemStatuses = {};
 let listAccountsCache = [];
+let blacklistedAccounts = [];
+let accountBlacklistModalOpen = false;
 let draggedAccountId = '';
 let touchDraggedAccountId = '';
 let touchDragChanged = false;
@@ -231,6 +233,9 @@ function navigate(route) {
   } else {
     visitorVisibleCount = VISITOR_LOG_BATCH_SIZE;
   }
+  if (route !== 'list') {
+    accountBlacklistModalOpen = false;
+  }
   window.location.hash = route === 'home' ? '' : route;
   void render();
 }
@@ -352,6 +357,71 @@ function renderCreatePage() {
   `);
 }
 
+function accountBlacklistRowTemplate(account) {
+  const gameAvatar = account.details?.avatar_image?.trim() || '';
+  const gameName = account.name?.trim() || '-';
+  const statusView = getDefaultRedeemStatus(account.status);
+  const avatarContent = gameAvatar
+    ? `<img class="avatar-image" src="${escapeAttribute(gameAvatar)}" alt="${escapeAttribute(gameName || account.accountId)}" loading="lazy" />`
+    : '<span class="avatar-fallback">无头像</span>';
+
+  return `
+    <tr>
+      <td data-label="头像">${avatarContent}</td>
+      <td data-label="账号ID"><span class="mono-text">${escapeHtml(account.accountId)}</span></td>
+      <td data-label="游戏名">${escapeHtml(gameName)}</td>
+      <td data-label="状态">
+        <span class="status-badge status-${statusView.code}">${escapeHtml(statusView.text)}</span>
+      </td>
+      <td data-label="操作">
+        <button class="secondary-button" data-unblacklist-account="${escapeAttribute(account.accountId)}">移出黑名单</button>
+      </td>
+    </tr>
+  `;
+}
+
+function renderAccountBlacklistModal() {
+  if (!isAdminUser()) {
+    return '';
+  }
+
+  const modalContent =
+    blacklistedAccounts.length === 0
+      ? '<div class="empty-state blacklist-empty">当前没有黑名单账号。</div>'
+      : `
+      <div class="table-wrap blacklist-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>头像</th>
+              <th>账号ID</th>
+              <th>游戏名</th>
+              <th>状态</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>${blacklistedAccounts.map(accountBlacklistRowTemplate).join('')}</tbody>
+        </table>
+      </div>
+    `;
+
+  return `
+    <div class="visitor-modal-backdrop" id="account-blacklist-modal" ${accountBlacklistModalOpen ? '' : 'hidden'}>
+      <div class="visitor-modal" role="dialog" aria-modal="true" aria-labelledby="account-blacklist-title">
+        <div class="visitor-modal-head">
+          <h3 id="account-blacklist-title">账号黑名单</h3>
+        </div>
+        <div class="visitor-modal-body">
+          ${modalContent}
+        </div>
+        <div class="visitor-modal-actions">
+          <button class="secondary-button" id="close-account-blacklist">关闭</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function accountRowTemplate(account) {
   const gameAvatar = account.details?.avatar_image?.trim() || '';
   const gameZone = account.details?.kid?.toString().trim() || '-';
@@ -384,6 +454,7 @@ function accountRowTemplate(account) {
         isAdminUser()
           ? `
       <td class="table-actions" data-label="操作">
+        <button class="secondary-button" data-blacklist-account="${escapeAttribute(account.accountId)}">拉黑</button>
         <button class="danger-button" data-delete-account="${escapeAttribute(account.accountId)}">删除</button>
       </td>
       `
@@ -394,8 +465,12 @@ function accountRowTemplate(account) {
 }
 
 async function renderListPage() {
-  const accounts = await api('/api/accounts');
+  const [accounts, adminBlacklistedAccounts] = await Promise.all([
+    api('/api/accounts'),
+    isAdminUser() ? api('/api/accounts/blacklist') : Promise.resolve([])
+  ]);
   listAccountsCache = accounts;
+  blacklistedAccounts = adminBlacklistedAccounts;
   const filteredAccounts = accounts.filter((account) => {
     const accountIdMatches =
       accountIdFilter.trim() === '' || account.accountId.toLowerCase().includes(accountIdFilter.trim().toLowerCase());
@@ -405,15 +480,27 @@ async function renderListPage() {
   });
 
   return createShell(`
-    <section class="page-head">
-      <div class="list-toolbar">
-        <input id="search-account-id" class="search-input" type="text" placeholder="搜索账号ID" value="${escapeAttribute(accountIdFilter)}" />
-        <input id="search-game-name" class="search-input" type="text" placeholder="搜索游戏名" value="${escapeAttribute(gameNameFilter)}" />
-        <button class="secondary-button toolbar-button" id="apply-search">搜索</button>
-        <button class="secondary-button toolbar-button" id="clear-search">清空搜索条件</button>
+    <section class="page-head list-page-head">
+      <div class="page-head-main">
+        <div class="list-summary">
+          <span class="list-summary-label">总用户人数</span>
+          <strong class="list-summary-value">${accounts.length}</strong>
+          ${
+            filteredAccounts.length !== accounts.length
+              ? `<span class="list-summary-meta">当前显示 ${filteredAccounts.length} 人</span>`
+              : ''
+          }
+        </div>
+        <div class="list-toolbar">
+          <input id="search-account-id" class="search-input" type="text" placeholder="搜索账号ID" value="${escapeAttribute(accountIdFilter)}" />
+          <input id="search-game-name" class="search-input" type="text" placeholder="搜索游戏名" value="${escapeAttribute(gameNameFilter)}" />
+          <button class="secondary-button toolbar-button" id="apply-search">搜索</button>
+          <button class="secondary-button toolbar-button" id="clear-search">清空搜索条件</button>
+        </div>
       </div>
-      <div class="page-actions">
+      <div class="page-actions list-page-actions">
         <button class="secondary-button" id="refresh-accounts">刷新</button>
+        ${isAdminUser() ? `<button class="secondary-button" id="view-account-blacklist">查看黑名单 (${blacklistedAccounts.length})</button>` : ''}
         ${isAdminUser() ? '<button class="danger-button" id="delete-all-accounts">一键删除</button>' : ''}
       </div>
     </section>
@@ -430,7 +517,7 @@ async function renderListPage() {
           : filteredAccounts.length === 0
             ? '<div class="empty-state">没有匹配到符合条件的账号。</div>'
             : `
-            <div class="table-wrap">
+            <div class="table-wrap account-list-wrap">
               <table>
                 <thead>
                   <tr>
@@ -448,6 +535,7 @@ async function renderListPage() {
           `
       }
     </section>
+    ${renderAccountBlacklistModal()}
   `);
 }
 
@@ -891,6 +979,8 @@ function bindEvents() {
       redeemConfigLoaded = false;
       redeemAccounts = [];
       redeemStatuses = {};
+      blacklistedAccounts = [];
+      accountBlacklistModalOpen = false;
       visitorLogs = [];
       visitorBlacklist = [];
       visitorPathFilter = '';
@@ -1060,6 +1150,27 @@ function bindEvents() {
     } finally {
       deleteAllButton.disabled = false;
     }
+  });
+
+  const viewAccountBlacklistButton = document.querySelector('#view-account-blacklist');
+  viewAccountBlacklistButton?.addEventListener('click', () => {
+    accountBlacklistModalOpen = true;
+    void render();
+  });
+
+  const accountBlacklistModal = document.querySelector('#account-blacklist-modal');
+  accountBlacklistModal?.addEventListener('click', (event) => {
+    if (event.target !== accountBlacklistModal) {
+      return;
+    }
+    accountBlacklistModalOpen = false;
+    void render();
+  });
+
+  const closeAccountBlacklistButton = document.querySelector('#close-account-blacklist');
+  closeAccountBlacklistButton?.addEventListener('click', () => {
+    accountBlacklistModalOpen = false;
+    void render();
   });
 
   const applySearchButton = document.querySelector('#apply-search');
@@ -1507,6 +1618,45 @@ function bindEvents() {
       button.disabled = true;
       try {
         await api(`/api/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
+        await render();
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-blacklist-account]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const accountId = button.dataset.blacklistAccount;
+      if (!accountId) {
+        return;
+      }
+      if (!window.confirm('确定将该账号加入黑名单吗？加入后不会出现在兑换列表，也不会参与兑换操作。')) {
+        return;
+      }
+
+      button.disabled = true;
+      try {
+        await api(`/api/accounts/${encodeURIComponent(accountId)}/blacklist`, { method: 'POST' });
+        accountBlacklistModalOpen = false;
+        await render();
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+
+  document.querySelectorAll('[data-unblacklist-account]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const accountId = button.dataset.unblacklistAccount;
+      if (!accountId) {
+        return;
+      }
+
+      button.disabled = true;
+      try {
+        await api(`/api/accounts/${encodeURIComponent(accountId)}/blacklist`, { method: 'DELETE' });
+        accountBlacklistModalOpen = true;
         await render();
       } finally {
         button.disabled = false;
