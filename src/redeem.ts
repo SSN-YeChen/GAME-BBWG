@@ -20,6 +20,8 @@ const LOGIN_TO_REDEEM_DELAY_MS = 200;
 const CHUNK_DELAY_MS = 4000;
 const CHUNK_SIZE = 30;
 const RETRY_AFTER_429_MS = 5000;
+const TIMEOUT_RETRY_DELAY_MS = 2000;
+const MAX_TIMEOUT_RETRY_ATTEMPTS = 2;
 
 export interface RedeemSummary {
   total: number;
@@ -57,6 +59,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function isTimeoutRetryMessage(message: string): boolean {
+  return message.trim().toUpperCase() === 'TIMEOUT RETRY.';
 }
 
 async function postFormJson(
@@ -174,6 +180,41 @@ export class RedeemService extends EventEmitter {
     }
   }
 
+  private async submitRedeemWithTimeoutRetry(accountId: string, giftCode: string): Promise<ApiEnvelope> {
+    let lastResult: ApiEnvelope = { msg: '未知错误' };
+
+    for (let attempt = 0; attempt < MAX_TIMEOUT_RETRY_ATTEMPTS; attempt += 1) {
+      this.ensureNotCancelled();
+      this.activeController = new AbortController();
+
+      const redeemResponse = await postFormJson(
+        REDEEM_URL,
+        buildSignedParams({
+          fid: accountId,
+          cdk: giftCode,
+          captcha_code: ''
+        }),
+        15_000,
+        this.activeController
+      );
+
+      if (!redeemResponse.ok) {
+        throw new Error(`HTTP ${redeemResponse.status}`);
+      }
+
+      lastResult = (await redeemResponse.json()) as ApiEnvelope;
+      const message = lastResult.msg ?? '未知错误';
+      if (!isTimeoutRetryMessage(message) || attempt === MAX_TIMEOUT_RETRY_ATTEMPTS - 1) {
+        return lastResult;
+      }
+
+      this.log('warn', `兑换返回 TIMEOUT RETRY.，2 秒后重试 (${accountId})`);
+      await this.sleepWithCancel(TIMEOUT_RETRY_DELAY_MS);
+    }
+
+    return lastResult;
+  }
+
   async runBatchRedeem(giftCode: string, targetAccountIds?: string[]): Promise<RedeemSummary> {
     if (this.running) {
       throw new Error('当前已有兑换任务正在执行，请稍后再试。');
@@ -275,27 +316,7 @@ export class RedeemService extends EventEmitter {
 
             this.log('success', `登录成功: ${nickname || account.accountId} (${account.accountId})`);
             await this.sleepWithCancel(LOGIN_TO_REDEEM_DELAY_MS);
-            this.activeController = new AbortController();
-
-            const redeemResponse = await postFormJson(
-              REDEEM_URL,
-              buildSignedParams({
-                fid: account.accountId,
-                cdk: trimmedCode,
-                captcha_code: ''
-              }),
-              15_000,
-              this.activeController
-            );
-
-            if (!redeemResponse.ok) {
-              failureCount += 1;
-              await updateAccountStatus(account.accountId, ACCOUNT_STATUS.failed);
-              this.log('error', `兑换请求失败: HTTP ${redeemResponse.status} (${account.accountId})`);
-              continue;
-            }
-
-            const redeemResult = (await redeemResponse.json()) as ApiEnvelope;
+            const redeemResult = await this.submitRedeemWithTimeoutRetry(account.accountId, trimmedCode);
             const code = redeemResult.code ?? null;
             const message = redeemResult.msg ?? '未知错误';
 
@@ -311,7 +332,7 @@ export class RedeemService extends EventEmitter {
             } else {
               failureCount += 1;
               await updateAccountStatus(account.accountId, ACCOUNT_STATUS.failed);
-                this.log('warn', `兑换失败: ${nickname || account.accountId} (${account.accountId}) - ${message}`);
+              this.log('warn', `兑换失败: ${nickname || account.accountId} (${account.accountId}) - ${message}`);
             }
           } catch (error) {
             if (error instanceof RedeemCancelledError) {
@@ -322,11 +343,17 @@ export class RedeemService extends EventEmitter {
             const message =
               error instanceof Error && error.name === 'AbortError'
                 ? '请求已中止'
+                : error instanceof Error && error.message.startsWith('HTTP ')
+                  ? error.message
                 : error instanceof Error
                   ? error.message
                   : '未知错误';
             await updateAccountStatus(account.accountId, ACCOUNT_STATUS.failed);
-            this.log('error', `异常: ${message} (${account.accountId})`);
+            if (error instanceof Error && error.message.startsWith('HTTP ')) {
+              this.log('error', `兑换请求失败: ${message} (${account.accountId})`);
+            } else {
+              this.log('error', `异常: ${message} (${account.accountId})`);
+            }
           } finally {
             this.activeController = null;
             processed += 1;
