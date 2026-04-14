@@ -4,6 +4,8 @@ const ACCOUNT_STATUS = {
   failed: 2
 };
 
+const REDEEM_CODE_STORAGE_KEY = 'bb-web:redeem-code';
+
 const app = document.querySelector('#app');
 let currentRoute = 'home';
 let authChecked = false;
@@ -20,7 +22,7 @@ let importInserted = 0;
 let importSkipped = 0;
 let importFailed = 0;
 let importCurrentAccountId = '';
-let redeemCode = '';
+let redeemCode = loadStoredRedeemCode();
 let redeemToken = '';
 let redeemIsRunning = false;
 let redeemProcessed = 0;
@@ -52,6 +54,28 @@ let eventSource = null;
 let importEventSource = null;
 let namePopupDismissBound = false;
 let visitorLogObserver = null;
+
+function loadStoredRedeemCode() {
+  try {
+    return window.localStorage.getItem(REDEEM_CODE_STORAGE_KEY)?.trim() || '';
+  } catch {
+    return '';
+  }
+}
+
+function persistRedeemCode(value) {
+  redeemCode = value.trim();
+
+  try {
+    if (redeemCode) {
+      window.localStorage.setItem(REDEEM_CODE_STORAGE_KEY, redeemCode);
+    } else {
+      window.localStorage.removeItem(REDEEM_CODE_STORAGE_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
 
 function getRedeemStatusView(account) {
   return redeemStatuses[account.accountId] ?? getDefaultRedeemStatus(account.status);
@@ -1451,9 +1475,13 @@ function bindEvents() {
     });
   }
 
+  const redeemCodeInput = document.querySelector('#redeem-code');
+  redeemCodeInput?.addEventListener('input', (event) => {
+    persistRedeemCode(event.currentTarget.value);
+  });
+
   const startRedeemButton = document.querySelector('#start-redeem');
   startRedeemButton?.addEventListener('click', async () => {
-    const redeemCodeInput = document.querySelector('#redeem-code');
     const nextRedeemCode = redeemCodeInput?.value.trim() ?? '';
 
     if (!nextRedeemCode) {
@@ -1463,7 +1491,7 @@ function bindEvents() {
       return;
     }
 
-    redeemCode = nextRedeemCode;
+    persistRedeemCode(nextRedeemCode);
     redeemIsRunning = true;
     redeemProcessed = 0;
     redeemTotal = 0;
@@ -1509,7 +1537,6 @@ function bindEvents() {
       return;
     }
 
-    const redeemCodeInput = document.querySelector('#redeem-code');
     const nextRedeemCode = redeemCodeInput?.value.trim() ?? redeemCode;
     if (!nextRedeemCode) {
       redeemLogs = [...redeemLogs, { level: 'error', message: '重新兑换前请先输入兑换码。' }];
@@ -1517,7 +1544,7 @@ function bindEvents() {
       return;
     }
 
-    redeemCode = nextRedeemCode;
+    persistRedeemCode(nextRedeemCode);
     redeemIsRunning = true;
     redeemProcessed = 0;
     redeemTotal = 0;
@@ -1791,6 +1818,9 @@ function refreshRedeemUi() {
   }
   if (redeemCodeInput) {
     redeemCodeInput.disabled = redeemIsRunning;
+    if (redeemCodeInput.value !== redeemCode) {
+      redeemCodeInput.value = redeemCode;
+    }
   }
   if (redeemTokenInput) {
     redeemTokenInput.disabled = redeemIsRunning;
