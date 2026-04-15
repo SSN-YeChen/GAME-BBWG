@@ -448,7 +448,7 @@ function renderAccountBlacklistModal() {
 
 function accountRowTemplate(account) {
   const gameAvatar = account.details?.avatar_image?.trim() || '';
-  const gameZone = account.details?.kid?.toString().trim() || '-';
+  const gameZone = account.kid?.toString().trim() || '-';
   const gameLevel = account.details?.stove_lv?.toString().trim() || '-';
   const gameName = account.name?.trim() || '-';
   const avatarContent = gameAvatar

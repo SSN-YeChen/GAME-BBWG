@@ -14,6 +14,7 @@ export type AccountStatus = (typeof ACCOUNT_STATUS)[keyof typeof ACCOUNT_STATUS]
 export interface AccountRow {
   accountId: string;
   name: string;
+  kid: string;
   status: AccountStatus;
   blacklisted: boolean;
   deleted: boolean;
@@ -76,6 +77,7 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
     CREATE TABLE IF NOT EXISTS accounts (
       account_id TEXT PRIMARY KEY,
       name TEXT NOT NULL DEFAULT '',
+      kid TEXT NOT NULL DEFAULT '',
       status INTEGER NOT NULL DEFAULT 0,
       is_blacklisted INTEGER NOT NULL DEFAULT 0,
       is_deleted INTEGER NOT NULL DEFAULT 0,
@@ -153,6 +155,10 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
   if (!hasDeleted) {
     await db.exec('ALTER TABLE accounts ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0');
   }
+  const hasKid = columns.some((column) => column.name === 'kid');
+  if (!hasKid) {
+    await db.exec("ALTER TABLE accounts ADD COLUMN kid TEXT NOT NULL DEFAULT ''");
+  }
 
   const sortStats = await db.get<{ zeroCount: number; maxSortOrder: number }>(
     'SELECT COUNT(*) FILTER (WHERE sort_order = 0) as zeroCount, COALESCE(MAX(sort_order), 0) as maxSortOrder FROM accounts'
@@ -190,6 +196,7 @@ export async function getDb(): Promise<Database<sqlite3.Database, sqlite3.Statem
 function toAccountRow(row: {
   account_id: string;
   name: string;
+  kid: string;
   status: number;
   is_blacklisted: number;
   is_deleted: number;
@@ -208,6 +215,7 @@ function toAccountRow(row: {
   return {
     accountId: row.account_id,
     name: row.name,
+    kid: row.kid,
     status: row.status as AccountStatus,
     blacklisted: row.is_blacklisted === 1,
     deleted: row.is_deleted === 1,
@@ -221,6 +229,17 @@ function toAccountRow(row: {
 async function getNextSortOrder(db: Database<sqlite3.Database, sqlite3.Statement>): Promise<number> {
   const row = await db.get<{ value: number }>('SELECT COALESCE(MAX(sort_order), 0) as value FROM accounts');
   return (row?.value ?? 0) + 1;
+}
+
+function extractAccountKid(details: Record<string, unknown>): string {
+  const kid = details.kid;
+  if (typeof kid === 'number' && Number.isFinite(kid)) {
+    return String(kid);
+  }
+  if (typeof kid === 'string') {
+    return kid.trim();
+  }
+  return '';
 }
 
 export async function getExistingAccountIds(accountIds: string[]): Promise<Set<string>> {
@@ -246,6 +265,7 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
         .map((account) => ({
           accountId: account.accountId.trim(),
           name: account.name.trim(),
+          kid: extractAccountKid(account.details ?? {}),
           details: account.details ?? {}
         }))
         .filter((account) => account.accountId)
@@ -274,9 +294,10 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
       if (existing?.is_deleted === 1) {
         await db.run(
           `UPDATE accounts
-           SET name = ?, status = ?, is_blacklisted = 0, is_deleted = 0, details = ?, sort_order = ?, updated_at = ?
+           SET name = ?, kid = ?, status = ?, is_blacklisted = 0, is_deleted = 0, details = ?, sort_order = ?, updated_at = ?
            WHERE account_id = ?`,
           account.name,
+          account.kid,
           ACCOUNT_STATUS.pending,
           JSON.stringify(account.details),
           nextSortOrder,
@@ -293,10 +314,11 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
       }
 
       await db.run(
-        `INSERT INTO accounts (account_id, name, status, is_blacklisted, is_deleted, details, sort_order, created_at, updated_at)
-         VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)`,
+        `INSERT INTO accounts (account_id, name, kid, status, is_blacklisted, is_deleted, details, sort_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
         account.accountId,
         account.name,
+        account.kid,
         ACCOUNT_STATUS.pending,
         JSON.stringify(account.details),
         nextSortOrder,
@@ -323,6 +345,7 @@ export async function listAccounts(): Promise<AccountRow[]> {
     {
       account_id: string;
       name: string;
+      kid: string;
       status: number;
       is_blacklisted: number;
       is_deleted: number;
@@ -341,6 +364,7 @@ export async function listBlacklistedAccounts(): Promise<AccountRow[]> {
     {
       account_id: string;
       name: string;
+      kid: string;
       status: number;
       is_blacklisted: number;
       is_deleted: number;
@@ -359,6 +383,7 @@ export async function listAccountsByStatus(status: AccountStatus): Promise<Accou
     {
       account_id: string;
       name: string;
+      kid: string;
       status: number;
       is_blacklisted: number;
       is_deleted: number;
@@ -386,6 +411,7 @@ export async function listAccountsByIds(accountIds: string[], options?: { includ
     {
       account_id: string;
       name: string;
+      kid: string;
       status: number;
       is_blacklisted: number;
       is_deleted: number;
@@ -419,6 +445,7 @@ export async function listAccountsByIdsIncludingDeleted(
     {
       account_id: string;
       name: string;
+      kid: string;
       status: number;
       is_blacklisted: number;
       is_deleted: number;
@@ -488,8 +515,9 @@ export async function updateAccountProfile(
 ): Promise<void> {
   const db = await getDb();
   await db.run(
-    'UPDATE accounts SET name = ?, details = ?, updated_at = ? WHERE account_id = ?',
+    'UPDATE accounts SET name = ?, kid = ?, details = ?, updated_at = ? WHERE account_id = ?',
     profile.name,
+    extractAccountKid(profile.details ?? {}),
     JSON.stringify(profile.details ?? {}),
     Date.now(),
     accountId
