@@ -570,6 +570,7 @@ function renderRedeemPage() {
     ? `
       <div class="redeem-toolbar">
         <input id="redeem-token" class="search-input redeem-input" type="text" placeholder="输入兑换 TOKEN" value="${escapeAttribute(redeemToken)}" ${redeemIsRunning ? 'disabled' : ''} />
+        <button class="secondary-button toolbar-button" id="fetch-redeem-token" ${redeemIsRunning ? 'disabled' : ''}>获取TOKEN</button>
         <button class="secondary-button toolbar-button" id="save-redeem-token" ${redeemIsRunning ? 'disabled' : ''}>保存TOKEN</button>
       </div>
       <div class="redeem-toolbar">
@@ -1617,6 +1618,35 @@ function bindEvents() {
   });
 
   const saveRedeemTokenButton = document.querySelector('#save-redeem-token');
+  const fetchRedeemTokenButton = document.querySelector('#fetch-redeem-token');
+  fetchRedeemTokenButton?.addEventListener('click', async () => {
+    try {
+      const config = await api('/api/config/redeem-token/fetch', {
+        method: 'POST'
+      });
+      redeemToken = config.redeemToken;
+      redeemLogs = [
+        ...redeemLogs,
+        {
+          level: 'success',
+          message: `已从目标站点抓取并保存 TOKEN。来源：${config.sourceUrl || '未知'}`
+        }
+      ];
+    } catch (error) {
+      redeemLogs = [
+        ...redeemLogs,
+        {
+          level: 'error',
+          message: error instanceof Error ? error.message : 'TOKEN 获取失败。'
+        }
+      ];
+    } finally {
+      if (currentRoute === 'redeem') {
+        void render();
+      }
+    }
+  });
+
   saveRedeemTokenButton?.addEventListener('click', async () => {
     const redeemTokenInput = document.querySelector('#redeem-token');
     const nextRedeemToken = redeemTokenInput?.value.trim() ?? '';
@@ -1789,6 +1819,7 @@ function refreshRedeemUi() {
   const stopRedeemButton = document.querySelector('#stop-redeem');
   const retryFailedRedeemButton = document.querySelector('#retry-failed-redeem');
   const forceCompleteRedeemButton = document.querySelector('#force-complete-redeem');
+  const fetchRedeemTokenButton = document.querySelector('#fetch-redeem-token');
   const saveRedeemTokenButton = document.querySelector('#save-redeem-token');
   const redeemCodeInput = document.querySelector('#redeem-code');
   const redeemTokenInput = document.querySelector('#redeem-token');
@@ -1812,6 +1843,9 @@ function refreshRedeemUi() {
   }
   if (forceCompleteRedeemButton) {
     forceCompleteRedeemButton.disabled = redeemIsRunning;
+  }
+  if (fetchRedeemTokenButton) {
+    fetchRedeemTokenButton.disabled = redeemIsRunning;
   }
   if (saveRedeemTokenButton) {
     saveRedeemTokenButton.disabled = redeemIsRunning;
