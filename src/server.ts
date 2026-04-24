@@ -47,6 +47,10 @@ const importSseClients = new Set<express.Response>();
 const autoRedeemQueue: string[] = [];
 const autoRedeemQueuedCodes = new Set<string>();
 let autoRedeemQueueRunning = false;
+const newAccountRedeemQueue: string[] = [];
+const newAccountRedeemQueuedIds = new Set<string>();
+let newAccountRedeemQueueRunning = false;
+let redeemTaskChain: Promise<void> = Promise.resolve();
 type UserRole = 'admin' | 'temp';
 type SessionRecord = { username: string; role: UserRole; expiresAt: number };
 const sessions = new Map<string, SessionRecord>();
@@ -280,6 +284,24 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+async function runRedeemTaskExclusive<T>(task: () => Promise<T>): Promise<T> {
+  const previousTask = redeemTaskChain;
+  let releaseTask: () => void = () => undefined;
+  redeemTaskChain = new Promise<void>((resolve) => {
+    releaseTask = resolve;
+  });
+
+  await previousTask;
+  try {
+    while (redeemService.isRunning()) {
+      await sleep(5000);
+    }
+    return await task();
+  } finally {
+    releaseTask();
+  }
+}
+
 async function enqueueAutoRedeemCodes(codes: string[]): Promise<void> {
   const normalizedCodes = Array.from(new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean)));
   if (normalizedCodes.length === 0) {
@@ -330,14 +352,12 @@ async function drainAutoRedeemQueue(): Promise<void> {
           continue;
         }
 
-        while (redeemService.isRunning()) {
-          await sleep(5000);
-        }
-
-        await ensureRedeemTokenForAutoRedeem();
-        // eslint-disable-next-line no-console
-        console.log(`auto redeem started for code ${code}`);
-        const summary = await runAutoRedeemWithSingleFailureRetry(code);
+        const summary = await runRedeemTaskExclusive(async () => {
+          await ensureRedeemTokenForAutoRedeem();
+          // eslint-disable-next-line no-console
+          console.log(`auto redeem started for code ${code}`);
+          return runAutoRedeemWithSingleFailureRetry(code);
+        });
         await completeRedeemCodeRedemption(code, summary);
         // eslint-disable-next-line no-console
         console.log(`auto redeem completed for code ${code}`);
@@ -389,6 +409,92 @@ async function runAutoRedeemWithSingleFailureRetry(code: string): Promise<Redeem
   const retrySummary = await redeemService.runBatchRedeem(code, failedAccountIds);
   // eslint-disable-next-line no-console
   console.log(`auto redeem retry completed for code ${code}`);
+
+  return {
+    total: firstSummary.total + retrySummary.total,
+    processed: firstSummary.processed + retrySummary.processed,
+    successCount: firstSummary.successCount + retrySummary.successCount,
+    receivedCount: firstSummary.receivedCount + retrySummary.receivedCount,
+    failureCount: retrySummary.failureCount,
+    remaining: retrySummary.remaining,
+    resetTriggered: firstSummary.resetTriggered || retrySummary.resetTriggered
+  };
+}
+
+function enqueueLatestRedeemForNewAccounts(accountIds: string[]): void {
+  for (const accountId of accountIds) {
+    const normalizedAccountId = accountId.trim();
+    if (!normalizedAccountId || newAccountRedeemQueuedIds.has(normalizedAccountId)) {
+      continue;
+    }
+
+    newAccountRedeemQueuedIds.add(normalizedAccountId);
+    newAccountRedeemQueue.push(normalizedAccountId);
+  }
+
+  void drainNewAccountRedeemQueue();
+}
+
+async function drainNewAccountRedeemQueue(): Promise<void> {
+  if (newAccountRedeemQueueRunning) {
+    return;
+  }
+
+  newAccountRedeemQueueRunning = true;
+  try {
+    while (newAccountRedeemQueue.length > 0) {
+      const accountIds = newAccountRedeemQueue.splice(0, newAccountRedeemQueue.length);
+      try {
+        const [latestCode] = await listRedeemCodes(1);
+        if (!latestCode) {
+          // eslint-disable-next-line no-console
+          console.log(`new account latest-code redeem skipped, no redeem code found. accounts=${accountIds.length}`);
+          continue;
+        }
+
+        await runRedeemTaskExclusive(async () => {
+          await ensureRedeemTokenForAutoRedeem();
+          // eslint-disable-next-line no-console
+          console.log(`new account latest-code redeem started: code=${latestCode.code}, accounts=${accountIds.length}`);
+          const summary = await runNewAccountRedeemWithSingleFailureRetry(latestCode.code, accountIds);
+          // eslint-disable-next-line no-console
+          console.log(
+            `new account latest-code redeem completed: code=${latestCode.code}, processed=${summary.processed}, failed=${summary.failureCount}`
+          );
+        });
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error('new account latest-code redeem failed', error);
+      } finally {
+        for (const accountId of accountIds) {
+          newAccountRedeemQueuedIds.delete(accountId);
+        }
+      }
+    }
+  } finally {
+    newAccountRedeemQueueRunning = false;
+  }
+}
+
+async function runNewAccountRedeemWithSingleFailureRetry(code: string, accountIds: string[]): Promise<RedeemSummary> {
+  const firstSummary = await redeemService.runRedeemForAccounts(code, accountIds);
+  if (firstSummary.failureCount === 0) {
+    return firstSummary;
+  }
+
+  const failedAccountIdSet = new Set(accountIds);
+  const failedAccountIds = (await listAccountsByStatus(ACCOUNT_STATUS.failed))
+    .map((account) => account.accountId)
+    .filter((accountId) => failedAccountIdSet.has(accountId));
+  if (failedAccountIds.length === 0) {
+    return firstSummary;
+  }
+
+  // eslint-disable-next-line no-console
+  console.log(`new account latest-code redeem retry started: code=${code}, accounts=${failedAccountIds.length}`);
+  const retrySummary = await redeemService.runBatchRedeem(code, failedAccountIds);
+  // eslint-disable-next-line no-console
+  console.log(`new account latest-code redeem retry completed: code=${code}`);
 
   return {
     total: firstSummary.total + retrySummary.total,
@@ -879,6 +985,7 @@ app.post('/api/accounts/batch', requireAuth, async (req, res) => {
     }
 
     const result = await createAccountsBatch(accountsToInsert);
+    enqueueLatestRedeemForNewAccounts(result.insertedAccountIds);
     broadcastImportProgress({
       type: 'done',
       total: normalizedIds.length,
@@ -890,7 +997,8 @@ app.post('/api/accounts/batch', requireAuth, async (req, res) => {
     res.json({
       inserted: result.inserted,
       skipped: normalizedIds.length - newIds.length,
-      failed
+      failed,
+      latestRedeemQueued: result.insertedAccountIds.length
     });
   } catch (error) {
     sendJsonError(res, error);

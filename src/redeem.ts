@@ -219,7 +219,7 @@ export class RedeemService extends EventEmitter {
   async runBatchRedeem(
     giftCode: string,
     targetAccountIds?: string[],
-    options?: { includeAllAccounts?: boolean }
+    options?: { includeAllAccounts?: boolean; includeTargetAccounts?: boolean }
   ): Promise<RedeemSummary> {
     if (this.running) {
       throw new Error('当前已有兑换任务正在执行，请稍后再试。');
@@ -240,10 +240,13 @@ export class RedeemService extends EventEmitter {
       }
 
       const includeAllAccounts = options?.includeAllAccounts ?? false;
+      const includeTargetAccounts = options?.includeTargetAccounts ?? false;
       let pendingAccounts = includeAllAccounts
         ? await listAccounts()
         : targetAccountIds && targetAccountIds.length > 0
-          ? (await listAccountsByIds(targetAccountIds)).filter((item) => item.status === ACCOUNT_STATUS.failed)
+          ? includeTargetAccounts
+            ? await listAccountsByIds(targetAccountIds)
+            : (await listAccountsByIds(targetAccountIds)).filter((item) => item.status === ACCOUNT_STATUS.failed)
           : await listAccountsByStatus(ACCOUNT_STATUS.pending);
 
       if (!includeAllAccounts && (!targetAccountIds || targetAccountIds.length === 0) && pendingAccounts.length === 0) {
@@ -381,7 +384,7 @@ export class RedeemService extends EventEmitter {
         }
       }
 
-      const remaining = includeAllAccounts ? 0 : await countAccountsByStatus(ACCOUNT_STATUS.pending);
+      const remaining = includeAllAccounts || includeTargetAccounts ? 0 : await countAccountsByStatus(ACCOUNT_STATUS.pending);
       const summary: RedeemSummary = {
         total,
         processed,
@@ -405,7 +408,8 @@ export class RedeemService extends EventEmitter {
       return summary;
     } catch (error) {
       if (error instanceof RedeemCancelledError) {
-        const remaining = options?.includeAllAccounts ? 0 : await countAccountsByStatus(ACCOUNT_STATUS.pending);
+        const remaining =
+          options?.includeAllAccounts || options?.includeTargetAccounts ? 0 : await countAccountsByStatus(ACCOUNT_STATUS.pending);
         const summary: RedeemSummary = {
           total,
           processed,
@@ -439,5 +443,9 @@ export class RedeemService extends EventEmitter {
 
   async runAutoRedeemForAllAccounts(giftCode: string): Promise<RedeemSummary> {
     return this.runBatchRedeem(giftCode, undefined, { includeAllAccounts: true });
+  }
+
+  async runRedeemForAccounts(giftCode: string, accountIds: string[]): Promise<RedeemSummary> {
+    return this.runBatchRedeem(giftCode, accountIds, { includeTargetAccounts: true });
   }
 }

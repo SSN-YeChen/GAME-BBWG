@@ -328,7 +328,7 @@ export async function getExistingAccountIds(accountIds: string[]): Promise<Set<s
   return new Set(existing.map((item) => item.account_id));
 }
 
-export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<{ inserted: number }> {
+export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<{ inserted: number; insertedAccountIds: string[] }> {
   const normalized = Array.from(
     new Map(
       accounts
@@ -343,7 +343,7 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
     ).values()
   );
   if (normalized.length === 0) {
-    return { inserted: 0 };
+    return { inserted: 0, insertedAccountIds: [] };
   }
 
   const db = await getDb();
@@ -356,6 +356,7 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
     );
     const existingMap = new Map(existingRows.map((row) => [row.account_id, row]));
     let inserted = 0;
+    const insertedAccountIds: string[] = [];
 
     for (const account of normalized) {
       const now = Date.now();
@@ -376,6 +377,7 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
         );
         nextSortOrder += 1;
         inserted += 1;
+        insertedAccountIds.push(account.accountId);
         continue;
       }
 
@@ -397,11 +399,13 @@ export async function createAccountsBatch(accounts: NewAccountInput[]): Promise<
       );
       nextSortOrder += 1;
       inserted += 1;
+      insertedAccountIds.push(account.accountId);
     }
     await db.exec('COMMIT');
 
     return {
-      inserted
+      inserted,
+      insertedAccountIds
     };
   } catch (error) {
     await db.exec('ROLLBACK');
