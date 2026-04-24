@@ -5,33 +5,48 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import {
+  ACCOUNT_STATUS,
   cleanupVisitorLogs,
+  completeRedeemCodeRedemption,
   createAccountsBatch,
   createVisitorLog,
   deleteAllVisitorLogs,
   deleteAccount,
   deleteAllAccounts,
   deleteBlacklistEntry,
+  failRedeemCodeRedemption,
   getBlacklistEntry,
   getDb,
   getExistingAccountIds,
   listAccounts,
   listBlacklistedAccounts,
   listBlacklistEntries,
+  listAccountsByStatus,
+  listRedeemCodes,
   listVisitorLogs,
+  reserveRedeemCodeRedemption,
   reorderAccounts,
   setAccountBlacklist,
   upsertBlacklistEntry
 } from './db.js';
-import { getRedeemConfig, setRedeemToken } from './config.js';
+import { getRedeemConfig, getRedeemToken, setRedeemToken } from './config.js';
 import { fetchPlayerProfile, waitForNextAccount } from './player.js';
-import { RedeemService, type RedeemProgressPayload } from './redeem.js';
+import { RedeemService, type RedeemProgressPayload, type RedeemSummary } from './redeem.js';
+import {
+  pauseTapTapRedeemCodePolling,
+  pollTapTapRedeemCodes,
+  resumeTapTapRedeemCodePolling,
+  startTapTapRedeemCodePolling
+} from './taptapRedeemCodes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const redeemService = new RedeemService();
 const sseClients = new Set<express.Response>();
 const importSseClients = new Set<express.Response>();
+const autoRedeemQueue: string[] = [];
+const autoRedeemQueuedCodes = new Set<string>();
+let autoRedeemQueueRunning = false;
 type UserRole = 'admin' | 'temp';
 type SessionRecord = { username: string; role: UserRole; expiresAt: number };
 const sessions = new Map<string, SessionRecord>();
@@ -39,6 +54,7 @@ const SESSION_COOKIE_NAME = 'bbwg_session';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const VISITOR_LOG_RETENTION_DAYS = 30;
 const VISITOR_LOG_CLEANUP_INTERVAL_MS = 1000 * 60 * 60 * 24;
+const AUTO_REDEEM_MAX_CODE_AGE_MS = 1000 * 60 * 60 * 24;
 const GIFT_CODE_SITE_URL = 'https://giftcode.benbenwangguo.cn/';
 const adminUsername = process.env.ADMIN_USERNAME?.trim() || '';
 const adminPassword = process.env.ADMIN_PASSWORD?.trim() || '';
@@ -256,6 +272,133 @@ function sendJsonError(res: express.Response, error: unknown, status = 500): voi
     ok: false,
     error: error instanceof Error ? error.message : '未知错误'
   });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function enqueueAutoRedeemCodes(codes: string[]): Promise<void> {
+  const normalizedCodes = Array.from(new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean)));
+  if (normalizedCodes.length === 0) {
+    return;
+  }
+
+  const redeemCodes = await listRedeemCodes(200);
+  const redeemCodeMap = new Map(redeemCodes.map((item) => [item.code, item]));
+  const now = Date.now();
+
+  for (const normalizedCode of normalizedCodes) {
+    if (!normalizedCode || autoRedeemQueuedCodes.has(normalizedCode)) {
+      continue;
+    }
+
+    const redeemCode = redeemCodeMap.get(normalizedCode);
+    const publishedAt = redeemCode?.publishedAt ?? 0;
+    if (publishedAt <= 0 || now - publishedAt > AUTO_REDEEM_MAX_CODE_AGE_MS) {
+      // eslint-disable-next-line no-console
+      console.log(`auto redeem skipped for old code ${normalizedCode}, publishedAt=${publishedAt || 'unknown'}`);
+      continue;
+    }
+
+    autoRedeemQueuedCodes.add(normalizedCode);
+    autoRedeemQueue.push(normalizedCode);
+  }
+
+  void drainAutoRedeemQueue();
+}
+
+async function drainAutoRedeemQueue(): Promise<void> {
+  if (autoRedeemQueueRunning) {
+    return;
+  }
+
+  autoRedeemQueueRunning = true;
+  pauseTapTapRedeemCodePolling();
+  try {
+    while (autoRedeemQueue.length > 0) {
+      const code = autoRedeemQueue.shift();
+      if (!code) {
+        continue;
+      }
+
+      try {
+        const reserved = await reserveRedeemCodeRedemption(code);
+        if (!reserved) {
+          continue;
+        }
+
+        while (redeemService.isRunning()) {
+          await sleep(5000);
+        }
+
+        await ensureRedeemTokenForAutoRedeem();
+        // eslint-disable-next-line no-console
+        console.log(`auto redeem started for code ${code}`);
+        const summary = await runAutoRedeemWithSingleFailureRetry(code);
+        await completeRedeemCodeRedemption(code, summary);
+        // eslint-disable-next-line no-console
+        console.log(`auto redeem completed for code ${code}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '未知错误';
+        await failRedeemCodeRedemption(code, message).catch((persistError: unknown) => {
+          // eslint-disable-next-line no-console
+          console.error('failed to persist auto redeem failure', persistError);
+        });
+        // eslint-disable-next-line no-console
+        console.error(`auto redeem failed for code ${code}`, error);
+      } finally {
+        autoRedeemQueuedCodes.delete(code);
+      }
+    }
+  } finally {
+    resumeTapTapRedeemCodePolling();
+    autoRedeemQueueRunning = false;
+  }
+}
+
+async function ensureRedeemTokenForAutoRedeem(): Promise<void> {
+  if (getRedeemToken()) {
+    return;
+  }
+
+  // eslint-disable-next-line no-console
+  console.log('redeem token is empty, fetching before auto redeem...');
+  const { token, sourceUrl } = await fetchRemoteRedeemToken();
+  setRedeemToken(token);
+  // eslint-disable-next-line no-console
+  console.log(`redeem token fetched before auto redeem: ${sourceUrl}`);
+}
+
+async function runAutoRedeemWithSingleFailureRetry(code: string): Promise<RedeemSummary> {
+  const firstSummary = await redeemService.runAutoRedeemForAllAccounts(code);
+  if (firstSummary.failureCount === 0) {
+    return firstSummary;
+  }
+
+  const failedAccounts = await listAccountsByStatus(ACCOUNT_STATUS.failed);
+  const failedAccountIds = failedAccounts.map((account) => account.accountId);
+  if (failedAccountIds.length === 0) {
+    return firstSummary;
+  }
+
+  // eslint-disable-next-line no-console
+  console.log(`auto redeem retry started for code ${code}, failed accounts=${failedAccountIds.length}`);
+  const retrySummary = await redeemService.runBatchRedeem(code, failedAccountIds);
+  // eslint-disable-next-line no-console
+  console.log(`auto redeem retry completed for code ${code}`);
+
+  return {
+    total: firstSummary.total + retrySummary.total,
+    processed: firstSummary.processed + retrySummary.processed,
+    successCount: firstSummary.successCount + retrySummary.successCount,
+    receivedCount: firstSummary.receivedCount + retrySummary.receivedCount,
+    failureCount: retrySummary.failureCount,
+    remaining: retrySummary.remaining,
+    resetTriggered: firstSummary.resetTriggered || retrySummary.resetTriggered
+  };
 }
 
 function extractScriptUrlsFromHtml(html: string, baseUrl: string): string[] {
@@ -898,6 +1041,31 @@ app.post('/api/config/redeem-token/fetch', requireRole('admin'), async (_req, re
   }
 });
 
+app.get('/api/redeem-codes', requireAuth, async (req, res) => {
+  try {
+    const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+    const parsedLimit = Number(rawLimit);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 50;
+    const rows = await listRedeemCodes(limit);
+    res.json(rows);
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
+app.post('/api/redeem-codes/sync', requireRole('admin'), async (_req, res) => {
+  try {
+    const result = await pollTapTapRedeemCodes();
+    await enqueueAutoRedeemCodes(result.insertedCodes);
+    res.json({
+      ok: true,
+      ...result
+    });
+  } catch (error) {
+    sendJsonError(res, error);
+  }
+});
+
 app.get('/api/visitor-logs', requireRole('admin'), async (req, res) => {
   try {
     const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
@@ -968,6 +1136,10 @@ app.get('*', (_req, res) => {
 const port = Number(process.env.PORT || 3458);
 
 void getDb().then(() => {
+  startTapTapRedeemCodePolling({
+    onNewCodes: enqueueAutoRedeemCodes
+  });
+
   void cleanupVisitorLogs(VISITOR_LOG_RETENTION_DAYS).catch((error: unknown) => {
     // eslint-disable-next-line no-console
     console.error('failed to cleanup visitor logs on startup', error);

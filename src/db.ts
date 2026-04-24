@@ -64,6 +64,36 @@ export interface BlacklistEntry {
   updatedAt: number;
 }
 
+export interface RedeemCodeInput {
+  code: string;
+  sourceId: string;
+  sourceUrl: string;
+  title: string;
+  summary: string;
+  content: string;
+  publishedAt: number;
+}
+
+export interface RedeemCodeRow extends RedeemCodeInput {
+  firstSeenAt: number;
+  lastSeenAt: number;
+  autoRedeemStatus?: RedeemCodeRedemptionStatus;
+  autoRedeemStartedAt?: number;
+  autoRedeemCompletedAt?: number;
+  autoRedeemLastError?: string;
+}
+
+export type RedeemCodeRedemptionStatus = 'running' | 'completed' | 'failed';
+
+export interface RedeemCodeRedemptionSummaryInput {
+  total: number;
+  processed: number;
+  successCount: number;
+  receivedCount: number;
+  failureCount: number;
+  remaining: number;
+}
+
 let dbPromise: Promise<Database<sqlite3.Database, sqlite3.Statement>> | null = null;
 
 function getDbPath(): string {
@@ -126,6 +156,46 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_visitor_blacklist_updated_at ON visitor_blacklist(updated_at DESC);
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS redeem_codes (
+      code TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL DEFAULT '',
+      source_url TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL DEFAULT '',
+      published_at INTEGER NOT NULL DEFAULT 0,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_redeem_codes_last_seen_at ON redeem_codes(last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_redeem_codes_published_at ON redeem_codes(published_at DESC);
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS redeem_code_redemptions (
+      code TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'running',
+      total INTEGER NOT NULL DEFAULT 0,
+      processed INTEGER NOT NULL DEFAULT 0,
+      success_count INTEGER NOT NULL DEFAULT 0,
+      received_count INTEGER NOT NULL DEFAULT 0,
+      failure_count INTEGER NOT NULL DEFAULT 0,
+      remaining INTEGER NOT NULL DEFAULT 0,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_redeem_code_redemptions_status ON redeem_code_redemptions(status);
+    CREATE INDEX IF NOT EXISTS idx_redeem_code_redemptions_updated_at ON redeem_code_redemptions(updated_at DESC);
+  `);
+
+  await db.exec(`
+    DROP TABLE IF EXISTS gift_codes;
+    DROP TABLE IF EXISTS gift_code_source_checks;
   `);
 
   const visitorLogColumns = await db.all<{ name: string }[]>('PRAGMA table_info(visitor_logs)');
@@ -744,4 +814,236 @@ export async function upsertBlacklistEntry(ipAddress: string, reason: string): P
 export async function deleteBlacklistEntry(ipAddress: string): Promise<void> {
   const db = await getDb();
   await db.run('DELETE FROM visitor_blacklist WHERE ip_address = ?', ipAddress);
+}
+
+function toRedeemCodeRow(row: {
+  code: string;
+  source_id: string;
+  source_url: string;
+  title: string;
+  summary: string;
+  content: string;
+  published_at: number;
+  first_seen_at: number;
+  last_seen_at: number;
+  auto_redeem_status?: string | null;
+  auto_redeem_started_at?: number | null;
+  auto_redeem_completed_at?: number | null;
+  auto_redeem_last_error?: string | null;
+}): RedeemCodeRow {
+  return {
+    code: row.code,
+    sourceId: row.source_id,
+    sourceUrl: row.source_url,
+    title: row.title,
+    summary: row.summary,
+    content: row.content,
+    publishedAt: row.published_at,
+    firstSeenAt: row.first_seen_at,
+    lastSeenAt: row.last_seen_at,
+    autoRedeemStatus:
+      row.auto_redeem_status === 'running' || row.auto_redeem_status === 'completed' || row.auto_redeem_status === 'failed'
+        ? row.auto_redeem_status
+        : undefined,
+    autoRedeemStartedAt: row.auto_redeem_started_at ?? undefined,
+    autoRedeemCompletedAt: row.auto_redeem_completed_at ?? undefined,
+    autoRedeemLastError: row.auto_redeem_last_error ?? undefined
+  };
+}
+
+export async function upsertRedeemCodes(
+  codes: RedeemCodeInput[]
+): Promise<{ inserted: number; updated: number; insertedCodes: string[] }> {
+  const normalized = Array.from(
+    new Map(
+      codes
+        .map((item) => ({
+          ...item,
+          code: item.code.trim().toUpperCase(),
+          sourceId: item.sourceId.trim(),
+          sourceUrl: item.sourceUrl.trim(),
+          title: item.title.trim(),
+          summary: item.summary.trim(),
+          content: item.content.trim()
+        }))
+        .filter((item) => item.code)
+        .map((item) => [item.code, item])
+    ).values()
+  );
+
+  if (normalized.length === 0) {
+    return { inserted: 0, updated: 0, insertedCodes: [] };
+  }
+
+  const db = await getDb();
+  await db.exec('BEGIN');
+  try {
+    let inserted = 0;
+    let updated = 0;
+    const insertedCodes: string[] = [];
+    const now = Date.now();
+
+    for (const item of normalized) {
+      const existing = await db.get<{ code: string }>('SELECT code FROM redeem_codes WHERE code = ?', item.code);
+      await db.run(
+        `INSERT INTO redeem_codes (
+          code,
+          source_id,
+          source_url,
+          title,
+          summary,
+          content,
+          published_at,
+          first_seen_at,
+          last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(code) DO UPDATE SET
+          source_id = excluded.source_id,
+          source_url = excluded.source_url,
+          title = excluded.title,
+          summary = excluded.summary,
+          content = excluded.content,
+          published_at = excluded.published_at,
+          last_seen_at = excluded.last_seen_at`,
+        item.code,
+        item.sourceId,
+        item.sourceUrl,
+        item.title,
+        item.summary,
+        item.content,
+        item.publishedAt,
+        now,
+        now
+      );
+
+      if (existing) {
+        updated += 1;
+      } else {
+        inserted += 1;
+        insertedCodes.push(item.code);
+      }
+    }
+
+    await db.exec('COMMIT');
+    return { inserted, updated, insertedCodes };
+  } catch (error) {
+    await db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+export async function listRedeemCodes(limit = 50): Promise<RedeemCodeRow[]> {
+  const db = await getDb();
+  const rows = await db.all<
+    {
+      code: string;
+      source_id: string;
+      source_url: string;
+      title: string;
+      summary: string;
+      content: string;
+      published_at: number;
+      first_seen_at: number;
+      last_seen_at: number;
+      auto_redeem_status?: string | null;
+      auto_redeem_started_at?: number | null;
+      auto_redeem_completed_at?: number | null;
+      auto_redeem_last_error?: string | null;
+    }[]
+  >(
+    `SELECT
+       redeem_codes.*,
+       redeem_code_redemptions.status AS auto_redeem_status,
+       redeem_code_redemptions.started_at AS auto_redeem_started_at,
+       redeem_code_redemptions.completed_at AS auto_redeem_completed_at,
+       redeem_code_redemptions.last_error AS auto_redeem_last_error
+     FROM redeem_codes
+     LEFT JOIN redeem_code_redemptions ON redeem_code_redemptions.code = redeem_codes.code
+     ORDER BY redeem_codes.published_at DESC, redeem_codes.last_seen_at DESC
+     LIMIT ?`,
+    Math.max(1, Math.min(limit, 200))
+  );
+
+  return rows.map(toRedeemCodeRow);
+}
+
+export async function reserveRedeemCodeRedemption(code: string): Promise<boolean> {
+  const normalizedCode = code.trim().toUpperCase();
+  if (!normalizedCode) {
+    return false;
+  }
+
+  const db = await getDb();
+  const now = Date.now();
+  const result = await db.run(
+    `INSERT OR IGNORE INTO redeem_code_redemptions (
+      code,
+      status,
+      started_at,
+      updated_at
+    ) VALUES (?, 'running', ?, ?)`,
+    normalizedCode,
+    now,
+    now
+  );
+
+  return (result.changes ?? 0) > 0;
+}
+
+export async function completeRedeemCodeRedemption(
+  code: string,
+  summary: RedeemCodeRedemptionSummaryInput
+): Promise<void> {
+  const normalizedCode = code.trim().toUpperCase();
+  if (!normalizedCode) {
+    return;
+  }
+
+  const db = await getDb();
+  const now = Date.now();
+  await db.run(
+    `UPDATE redeem_code_redemptions
+     SET status = 'completed',
+         total = ?,
+         processed = ?,
+         success_count = ?,
+         received_count = ?,
+         failure_count = ?,
+         remaining = ?,
+         completed_at = ?,
+         last_error = '',
+         updated_at = ?
+     WHERE code = ?`,
+    summary.total,
+    summary.processed,
+    summary.successCount,
+    summary.receivedCount,
+    summary.failureCount,
+    summary.remaining,
+    now,
+    now,
+    normalizedCode
+  );
+}
+
+export async function failRedeemCodeRedemption(code: string, error: string): Promise<void> {
+  const normalizedCode = code.trim().toUpperCase();
+  if (!normalizedCode) {
+    return;
+  }
+
+  const db = await getDb();
+  const now = Date.now();
+  await db.run(
+    `UPDATE redeem_code_redemptions
+     SET status = 'failed',
+         completed_at = ?,
+         last_error = ?,
+         updated_at = ?
+     WHERE code = ?`,
+    now,
+    error.trim(),
+    now,
+    normalizedCode
+  );
 }
