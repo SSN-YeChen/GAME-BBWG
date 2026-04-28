@@ -44,6 +44,10 @@ let pollTimer: NodeJS.Timeout | null = null;
 let pollInFlight = false;
 let pollingPaused = false;
 
+function formatLogTime(): string {
+  return new Date().toLocaleString('zh-CN', { hour12: false });
+}
+
 function buildTapTapFeedUrl(): string {
   const url = new URL(TAPTAP_FEED_URL);
   const xua = new URLSearchParams({
@@ -163,14 +167,14 @@ export function startTapTapRedeemCodePolling(options?: { onNewCodes?: (codes: st
     pollInFlight = true;
     try {
       const result = await pollTapTapRedeemCodes();
+      // eslint-disable-next-line no-console
+      console.log(`[${formatLogTime()}] TapTap 自动抓取兑换码：成功`);
       if (result.inserted > 0) {
-        // eslint-disable-next-line no-console
-        console.log(`TapTap redeem codes synced: found=${result.found}, inserted=${result.inserted}, updated=${result.updated}`);
         await options?.onNewCodes?.(result.insertedCodes);
       }
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.error('failed to poll TapTap redeem codes', error);
+      console.error(`[${formatLogTime()}] TapTap 自动抓取兑换码：失败`, error);
     } finally {
       pollInFlight = false;
     }

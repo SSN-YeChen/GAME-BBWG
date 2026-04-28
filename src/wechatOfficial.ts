@@ -60,6 +60,10 @@ let pollInFlight = false;
 let pollingPaused = false;
 let disabledByInvalidSession = false;
 
+function formatLogTime(): string {
+  return new Date().toLocaleString('zh-CN', { hour12: false });
+}
+
 function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
@@ -134,7 +138,11 @@ function buildArticleListUrl(begin = 0, count = 10): string {
   return url.toString();
 }
 
-async function fetchWechatArticleList(): Promise<WechatArticleInput[]> {
+function isInvalidWechatSession(ret: number | undefined, message: string): boolean {
+  return ret === 200003 || message.includes('invalid session');
+}
+
+async function requestWechatArticleList(): Promise<WechatArticleListResponse> {
   const config = getWechatMpConfig();
   if (!config.token || !config.cookie) {
     throw new Error('微信模式缺少 WECHAT_MP_TOKEN 或 WECHAT_MP_COOKIE。');
@@ -154,11 +162,16 @@ async function fetchWechatArticleList(): Promise<WechatArticleInput[]> {
     throw new Error(`微信文章列表请求失败: HTTP ${response.status}`);
   }
 
-  const payload = (await response.json()) as WechatArticleListResponse;
+  return (await response.json()) as WechatArticleListResponse;
+}
+
+async function fetchWechatArticleList(): Promise<WechatArticleInput[]> {
+  const config = getWechatMpConfig();
+  const payload = await requestWechatArticleList();
   const ret = payload.base_resp?.ret;
   if (ret !== 0) {
     const message = payload.base_resp?.err_msg || '未知错误';
-    if (ret === 200003 || message.includes('invalid session')) {
+    if (isInvalidWechatSession(ret, message)) {
       disabledByInvalidSession = true;
       throw new Error(`微信登录态已失效: ${message}`);
     }
@@ -193,6 +206,26 @@ async function fetchWechatArticleList(): Promise<WechatArticleInput[]> {
   }
 
   return articles;
+}
+
+export async function validateWechatMpSession(): Promise<boolean> {
+  const config = getWechatMpConfig();
+  if (!config.token || !config.cookie) {
+    return false;
+  }
+
+  try {
+    const payload = await requestWechatArticleList();
+    const ret = payload.base_resp?.ret;
+    const message = payload.base_resp?.err_msg || '';
+    return ret === 0 && !isInvalidWechatSession(ret, message);
+  } catch {
+    return false;
+  }
+}
+
+export function enableWechatRedeemCodePolling(): void {
+  disabledByInvalidSession = false;
 }
 
 async function fetchWechatArticleHtml(url: string): Promise<string> {
@@ -282,16 +315,14 @@ export function startWechatRedeemCodePolling(options?: { onNewCodes?: (codes: st
     pollInFlight = true;
     try {
       const result = await pollWechatRedeemCodes();
+      // eslint-disable-next-line no-console
+      console.log(`[${formatLogTime()}] 微信公众号自动抓取兑换码：成功`);
       if (result.inserted > 0) {
-        // eslint-disable-next-line no-console
-        console.log(
-          `WeChat redeem codes synced: articles=${result.foundArticles}, newArticles=${result.insertedArticles}, inserted=${result.inserted}, updated=${result.updated}`
-        );
         await options?.onNewCodes?.(result.insertedCodes);
       }
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.error('failed to poll WeChat redeem codes', error);
+      console.error(`[${formatLogTime()}] 微信公众号自动抓取兑换码：失败`, error);
     } finally {
       pollInFlight = false;
     }

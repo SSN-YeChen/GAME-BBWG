@@ -53,7 +53,7 @@ https://mp.weixin.qq.com/s/xxxxxx
 
 然后从文章正文中解析兑换码。
 
-微信模式依赖扫码登录。启动时终端会输出二维码；扫码并在手机上确认后，会把 `token/cookie/userAgent` 保存到 `config.json`。如果终端二维码无法识别，也会保存本地二维码图片到 `data/wechat-login-qrcode.jpg`。
+微信模式会优先复用上一次登录保存的 `token/cookie/userAgent`。启动时会先校验 `config.json` 中的微信登录态；校验通过就直接启动微信轮询，不再扫码。校验失败或没有历史登录态时，终端才会输出二维码；扫码并在手机上确认后，会把新的登录态保存到 `config.json`。如果终端二维码无法识别，也会保存本地二维码图片到 `data/wechat-login-qrcode.jpg`。
 
 ## 抓取规则
 
@@ -126,8 +126,10 @@ npm run dev -- --wechat
 说明：
 
 - `npm run start:wechat` 等价于 `node dist/server.js --wechat`。
-- 微信模式启动后会先尝试扫码登录公众号后台。
-- 扫码成功后才会启动微信文章轮询。
+- 微信模式启动后会先校验 `config.json` 中已有的公众号后台登录态。
+- 已有登录态有效时会跳过扫码，直接启动微信文章轮询。
+- 没有历史登录态或登录态失效时，才会进入扫码登录流程。
+- 扫码成功后会保存新的 `token/cookie/userAgent`，供下次启动校验复用。
 - 如果扫码失败、超时或登录态不可用，Web 服务仍会启动，只是不启用微信轮询。
 - 如果运行中微信登录态过期，微信轮询会停止，Web 服务和手动兑换功能不受影响。
 

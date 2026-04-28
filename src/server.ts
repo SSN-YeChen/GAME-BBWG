@@ -39,10 +39,12 @@ import {
   startTapTapRedeemCodePolling
 } from './taptapRedeemCodes.js';
 import {
+  enableWechatRedeemCodePolling,
   pauseWechatRedeemCodePolling,
   pollWechatRedeemCodes,
   resumeWechatRedeemCodePolling,
-  startWechatRedeemCodePolling
+  startWechatRedeemCodePolling,
+  validateWechatMpSession
 } from './wechatOfficial.js';
 import { loginWechatMpByQrCode } from './wechatLogin.js';
 
@@ -77,6 +79,10 @@ const sessionSecret = process.env.SESSION_SECRET?.trim() || 'bbwg-dev-session-se
 
 app.set('trust proxy', true);
 app.use(express.json());
+
+function formatLogTime(): string {
+  return new Date().toLocaleString('zh-CN', { hour12: false });
+}
 
 function normalizeIpAddress(value: string): string {
   const trimmed = value.trim();
@@ -409,12 +415,12 @@ async function drainAutoRedeemQueue(): Promise<void> {
         const summary = await runRedeemTaskExclusive(async () => {
           await ensureRedeemTokenForAutoRedeem();
           // eslint-disable-next-line no-console
-          console.log(`auto redeem started for code ${code}`);
+          console.log(`[${formatLogTime()}] 自动兑换开始：${code}`);
           return runAutoRedeemWithSingleFailureRetry(code);
         });
         await completeRedeemCodeRedemption(code, summary);
         // eslint-disable-next-line no-console
-        console.log(`auto redeem completed for code ${code}`);
+        console.log(`[${formatLogTime()}] 自动兑换结束：${code}`);
       } catch (error) {
         const message = error instanceof Error ? error.message : '未知错误';
         await failRedeemCodeRedemption(code, message).catch((persistError: unknown) => {
@@ -422,7 +428,7 @@ async function drainAutoRedeemQueue(): Promise<void> {
           console.error('failed to persist auto redeem failure', persistError);
         });
         // eslint-disable-next-line no-console
-        console.error(`auto redeem failed for code ${code}`, error);
+        console.error(`[${formatLogTime()}] 自动兑换失败：${code}`, error);
       } finally {
         autoRedeemQueuedCodes.delete(code);
       }
@@ -459,10 +465,10 @@ async function runAutoRedeemWithSingleFailureRetry(code: string): Promise<Redeem
   }
 
   // eslint-disable-next-line no-console
-  console.log(`auto redeem retry started for code ${code}, failed accounts=${failedAccountIds.length}`);
+  console.log(`[${formatLogTime()}] 自动兑换失败账号重试开始：${code}，失败账号数=${failedAccountIds.length}`);
   const retrySummary = await redeemService.runBatchRedeem(code, failedAccountIds);
   // eslint-disable-next-line no-console
-  console.log(`auto redeem retry completed for code ${code}`);
+  console.log(`[${formatLogTime()}] 自动兑换失败账号重试结束：${code}`);
 
   return {
     total: firstSummary.total + retrySummary.total,
@@ -1301,7 +1307,19 @@ void getDb()
   .then(async () => {
     if (useWechatSource) {
       try {
-        await loginWechatMpByQrCode();
+        // eslint-disable-next-line no-console
+        console.log('正在校验微信公众平台登录态...');
+        const sessionValid = await validateWechatMpSession();
+        if (sessionValid) {
+          enableWechatRedeemCodePolling();
+          // eslint-disable-next-line no-console
+          console.log('微信公众平台登录态有效，跳过扫码登录。');
+        } else {
+          // eslint-disable-next-line no-console
+          console.log('微信公众平台未登录或登录态已失效，开始扫码登录。');
+          await loginWechatMpByQrCode();
+          enableWechatRedeemCodePolling();
+        }
       } catch (error) {
         wechatPollingAvailable = false;
         // eslint-disable-next-line no-console
