@@ -38,6 +38,13 @@ import {
   resumeTapTapRedeemCodePolling,
   startTapTapRedeemCodePolling
 } from './taptapRedeemCodes.js';
+import {
+  pauseWechatRedeemCodePolling,
+  pollWechatRedeemCodes,
+  resumeWechatRedeemCodePolling,
+  startWechatRedeemCodePolling
+} from './wechatOfficial.js';
+import { loginWechatMpByQrCode } from './wechatLogin.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -60,6 +67,8 @@ const VISITOR_LOG_RETENTION_DAYS = 30;
 const VISITOR_LOG_CLEANUP_INTERVAL_MS = 1000 * 60 * 60 * 24;
 const AUTO_REDEEM_MAX_CODE_AGE_MS = 1000 * 60 * 60 * 24;
 const GIFT_CODE_SITE_URL = 'https://giftcode.benbenwangguo.cn/';
+const useWechatSource = process.argv.includes('--wechat');
+let wechatPollingAvailable = true;
 const adminUsername = process.env.ADMIN_USERNAME?.trim() || '';
 const adminPassword = process.env.ADMIN_PASSWORD?.trim() || '';
 const tempUsername = process.env.TEMP_USERNAME?.trim() || '';
@@ -302,6 +311,51 @@ async function runRedeemTaskExclusive<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 
+async function pollActiveRedeemCodeSource(): Promise<{ insertedCodes: string[] }> {
+  return useWechatSource ? pollWechatRedeemCodes() : pollTapTapRedeemCodes();
+}
+
+function startActiveRedeemCodePolling(): void {
+  if (useWechatSource) {
+    if (!wechatPollingAvailable) {
+      // eslint-disable-next-line no-console
+      console.warn('redeem code source: WeChat official account is disabled because login failed');
+      return;
+    }
+
+    // eslint-disable-next-line no-console
+    console.log('redeem code source: WeChat official account');
+    startWechatRedeemCodePolling({
+      onNewCodes: enqueueAutoRedeemCodes
+    });
+    return;
+  }
+
+  // eslint-disable-next-line no-console
+  console.log('redeem code source: TapTap official topic');
+  startTapTapRedeemCodePolling({
+    onNewCodes: enqueueAutoRedeemCodes
+  });
+}
+
+function pauseActiveRedeemCodePolling(): void {
+  if (useWechatSource) {
+    pauseWechatRedeemCodePolling();
+    return;
+  }
+
+  pauseTapTapRedeemCodePolling();
+}
+
+function resumeActiveRedeemCodePolling(): void {
+  if (useWechatSource) {
+    resumeWechatRedeemCodePolling();
+    return;
+  }
+
+  resumeTapTapRedeemCodePolling();
+}
+
 async function enqueueAutoRedeemCodes(codes: string[]): Promise<void> {
   const normalizedCodes = Array.from(new Set(codes.map((code) => code.trim().toUpperCase()).filter(Boolean)));
   if (normalizedCodes.length === 0) {
@@ -338,7 +392,7 @@ async function drainAutoRedeemQueue(): Promise<void> {
   }
 
   autoRedeemQueueRunning = true;
-  pauseTapTapRedeemCodePolling();
+  pauseActiveRedeemCodePolling();
   try {
     while (autoRedeemQueue.length > 0) {
       const code = autoRedeemQueue.shift();
@@ -374,7 +428,7 @@ async function drainAutoRedeemQueue(): Promise<void> {
       }
     }
   } finally {
-    resumeTapTapRedeemCodePolling();
+    resumeActiveRedeemCodePolling();
     autoRedeemQueueRunning = false;
   }
 }
@@ -1163,7 +1217,7 @@ app.get('/api/redeem-codes', requireAuth, async (req, res) => {
 
 app.post('/api/redeem-codes/sync', requireRole('admin'), async (_req, res) => {
   try {
-    const result = await pollTapTapRedeemCodes();
+    const result = await pollActiveRedeemCodeSource();
     await enqueueAutoRedeemCodes(result.insertedCodes);
     res.json({
       ok: true,
@@ -1243,24 +1297,38 @@ app.get('*', (_req, res) => {
 
 const port = Number(process.env.PORT || 3458);
 
-void getDb().then(() => {
-  startTapTapRedeemCodePolling({
-    onNewCodes: enqueueAutoRedeemCodes
-  });
+void getDb()
+  .then(async () => {
+    if (useWechatSource) {
+      try {
+        await loginWechatMpByQrCode();
+      } catch (error) {
+        wechatPollingAvailable = false;
+        // eslint-disable-next-line no-console
+        console.error('WeChat login failed, web server will continue without WeChat polling', error);
+      }
+    }
 
-  void cleanupVisitorLogs(VISITOR_LOG_RETENTION_DAYS).catch((error: unknown) => {
-    // eslint-disable-next-line no-console
-    console.error('failed to cleanup visitor logs on startup', error);
-  });
-  setInterval(() => {
+    startActiveRedeemCodePolling();
+
     void cleanupVisitorLogs(VISITOR_LOG_RETENTION_DAYS).catch((error: unknown) => {
       // eslint-disable-next-line no-console
-      console.error('failed to cleanup visitor logs', error);
+      console.error('failed to cleanup visitor logs on startup', error);
     });
-  }, VISITOR_LOG_CLEANUP_INTERVAL_MS);
+    setInterval(() => {
+      void cleanupVisitorLogs(VISITOR_LOG_RETENTION_DAYS).catch((error: unknown) => {
+        // eslint-disable-next-line no-console
+        console.error('failed to cleanup visitor logs', error);
+      });
+    }, VISITOR_LOG_CLEANUP_INTERVAL_MS);
 
-  app.listen(port, () => {
+    app.listen(port, () => {
+      // eslint-disable-next-line no-console
+      console.log(`bb-web is running at http://localhost:${port}`);
+    });
+  })
+  .catch((error: unknown) => {
     // eslint-disable-next-line no-console
-    console.log(`bb-web is running at http://localhost:${port}`);
+    console.error('failed to start bb-web', error);
+    process.exitCode = 1;
   });
-});

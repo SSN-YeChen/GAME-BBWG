@@ -94,6 +94,26 @@ export interface RedeemCodeRedemptionSummaryInput {
   remaining: number;
 }
 
+export interface WechatArticleInput {
+  aid: string;
+  title: string;
+  link: string;
+  author: string;
+  fakeid: string;
+  digest: string;
+  cover: string;
+  publishedAt: number;
+  updatedAt: number;
+}
+
+export interface WechatArticleDetailInput {
+  aid: string;
+  html: string;
+  text: string;
+  fetchStatus: 'ok' | 'failed';
+  fetchError: string;
+}
+
 let dbPromise: Promise<Database<sqlite3.Database, sqlite3.Statement>> | null = null;
 
 function getDbPath(): string {
@@ -191,6 +211,29 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
     );
     CREATE INDEX IF NOT EXISTS idx_redeem_code_redemptions_status ON redeem_code_redemptions(status);
     CREATE INDEX IF NOT EXISTS idx_redeem_code_redemptions_updated_at ON redeem_code_redemptions(updated_at DESC);
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS wechat_articles (
+      aid TEXT PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '',
+      link TEXT NOT NULL DEFAULT '',
+      author TEXT NOT NULL DEFAULT '',
+      fakeid TEXT NOT NULL DEFAULT '',
+      digest TEXT NOT NULL DEFAULT '',
+      cover TEXT NOT NULL DEFAULT '',
+      html TEXT NOT NULL DEFAULT '',
+      text TEXT NOT NULL DEFAULT '',
+      fetch_status TEXT NOT NULL DEFAULT 'pending',
+      fetch_error TEXT NOT NULL DEFAULT '',
+      published_at INTEGER NOT NULL DEFAULT 0,
+      source_updated_at INTEGER NOT NULL DEFAULT 0,
+      first_seen_at INTEGER NOT NULL,
+      last_seen_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_wechat_articles_published_at ON wechat_articles(published_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_wechat_articles_last_seen_at ON wechat_articles(last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_wechat_articles_fakeid ON wechat_articles(fakeid);
   `);
 
   await db.exec(`
@@ -818,6 +861,144 @@ export async function upsertBlacklistEntry(ipAddress: string, reason: string): P
 export async function deleteBlacklistEntry(ipAddress: string): Promise<void> {
   const db = await getDb();
   await db.run('DELETE FROM visitor_blacklist WHERE ip_address = ?', ipAddress);
+}
+
+export async function upsertWechatArticles(articles: WechatArticleInput[]): Promise<{ insertedAids: string[]; updated: number }> {
+  const normalized = Array.from(
+    new Map(
+      articles
+        .map((article) => ({
+          ...article,
+          aid: article.aid.trim(),
+          title: article.title.trim(),
+          link: article.link.trim(),
+          author: article.author.trim(),
+          fakeid: article.fakeid.trim(),
+          digest: article.digest.trim(),
+          cover: article.cover.trim()
+        }))
+        .filter((article) => article.aid && article.link)
+        .map((article) => [article.aid, article])
+    ).values()
+  );
+
+  if (normalized.length === 0) {
+    return { insertedAids: [], updated: 0 };
+  }
+
+  const db = await getDb();
+  await db.exec('BEGIN');
+  try {
+    const now = Date.now();
+    const insertedAids: string[] = [];
+    let updated = 0;
+
+    for (const article of normalized) {
+      const existing = await db.get<{ aid: string }>('SELECT aid FROM wechat_articles WHERE aid = ?', article.aid);
+      await db.run(
+        `INSERT INTO wechat_articles (
+          aid,
+          title,
+          link,
+          author,
+          fakeid,
+          digest,
+          cover,
+          published_at,
+          source_updated_at,
+          first_seen_at,
+          last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(aid) DO UPDATE SET
+          title = excluded.title,
+          link = excluded.link,
+          author = excluded.author,
+          fakeid = excluded.fakeid,
+          digest = excluded.digest,
+          cover = excluded.cover,
+          published_at = excluded.published_at,
+          source_updated_at = excluded.source_updated_at,
+          last_seen_at = excluded.last_seen_at`,
+        article.aid,
+        article.title,
+        article.link,
+        article.author,
+        article.fakeid,
+        article.digest,
+        article.cover,
+        article.publishedAt,
+        article.updatedAt,
+        now,
+        now
+      );
+
+      if (existing) {
+        updated += 1;
+      } else {
+        insertedAids.push(article.aid);
+      }
+    }
+
+    await db.exec('COMMIT');
+    return { insertedAids, updated };
+  } catch (error) {
+    await db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+export async function updateWechatArticleDetail(input: WechatArticleDetailInput): Promise<void> {
+  const db = await getDb();
+  await db.run(
+    `UPDATE wechat_articles
+     SET html = ?,
+         text = ?,
+         fetch_status = ?,
+         fetch_error = ?,
+         last_seen_at = ?
+     WHERE aid = ?`,
+    input.html,
+    input.text,
+    input.fetchStatus,
+    input.fetchError,
+    Date.now(),
+    input.aid.trim()
+  );
+}
+
+export async function listWechatArticlesByAids(aids: string[]): Promise<WechatArticleInput[]> {
+  const normalized = Array.from(new Set(aids.map((aid) => aid.trim()).filter(Boolean)));
+  if (normalized.length === 0) {
+    return [];
+  }
+
+  const db = await getDb();
+  const placeholders = normalized.map(() => '?').join(',');
+  const rows = await db.all<
+    {
+      aid: string;
+      title: string;
+      link: string;
+      author: string;
+      fakeid: string;
+      digest: string;
+      cover: string;
+      published_at: number;
+      source_updated_at: number;
+    }[]
+  >(`SELECT * FROM wechat_articles WHERE aid IN (${placeholders})`, normalized);
+
+  return rows.map((row) => ({
+    aid: row.aid,
+    title: row.title,
+    link: row.link,
+    author: row.author,
+    fakeid: row.fakeid,
+    digest: row.digest,
+    cover: row.cover,
+    publishedAt: row.published_at,
+    updatedAt: row.source_updated_at
+  }));
 }
 
 function toRedeemCodeRow(row: {
