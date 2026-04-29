@@ -11,8 +11,8 @@ import {
   resetAccountsStatus,
   updateAccountProfile,
   updateAccountStatus
-} from './db.js';
-import { getRedeemToken } from './config.js';
+} from '../core/db.js';
+import { getRedeemToken } from '../core/config.js';
 
 const LOGIN_URL = 'https://giftcode-api.benbenwangguo.cn/api/player';
 const REDEEM_URL = 'https://giftcode-api.benbenwangguo.cn/api/gift_code';

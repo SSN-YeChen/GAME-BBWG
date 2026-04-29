@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
 import qrcode from 'qrcode-terminal';
-import { getWechatMpConfig, setWechatMpSession } from './config.js';
+import { getWechatMpConfig, setWechatMpSession } from '../core/config.js';
 
 const require = createRequire(import.meta.url);
 const jsQR = require('jsqr') as (

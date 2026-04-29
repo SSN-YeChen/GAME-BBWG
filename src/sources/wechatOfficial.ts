@@ -5,8 +5,8 @@ import {
   updateWechatArticleDetail,
   upsertRedeemCodes,
   upsertWechatArticles
-} from './db.js';
-import { getWechatMpConfig } from './config.js';
+} from '../core/db.js';
+import { getWechatMpConfig } from '../core/config.js';
 
 const WECHAT_APPMSG_PUBLISH_URL = 'https://mp.weixin.qq.com/cgi-bin/appmsgpublish';
 const POLL_INTERVAL_MS = 60_000;

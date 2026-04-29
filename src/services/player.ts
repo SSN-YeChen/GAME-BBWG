@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getRedeemToken } from './config.js';
+import { getRedeemToken } from '../core/config.js';
 
 const LOGIN_URL = 'https://giftcode-api.benbenwangguo.cn/api/player';
 const REQUEST_DELAY_MS = 1200;

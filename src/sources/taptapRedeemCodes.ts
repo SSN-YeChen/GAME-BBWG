@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { type RedeemCodeInput, upsertRedeemCodes } from './db.js';
+import { type RedeemCodeInput, upsertRedeemCodes } from '../core/db.js';
 
 const TAPTAP_TOPIC_URL = 'https://www.taptap.cn/app/759692/topic?type=official';
 const TAPTAP_FEED_URL = 'https://www.taptap.cn/webapiv2/feed/v7/by-group';

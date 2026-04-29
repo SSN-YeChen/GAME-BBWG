@@ -235,62 +235,6 @@ async function initSchema(db: Database<sqlite3.Database, sqlite3.Statement>): Pr
     CREATE INDEX IF NOT EXISTS idx_wechat_articles_last_seen_at ON wechat_articles(last_seen_at DESC);
     CREATE INDEX IF NOT EXISTS idx_wechat_articles_fakeid ON wechat_articles(fakeid);
   `);
-
-  await db.exec(`
-    DROP TABLE IF EXISTS gift_codes;
-    DROP TABLE IF EXISTS gift_code_source_checks;
-  `);
-
-  const visitorLogColumns = await db.all<{ name: string }[]>('PRAGMA table_info(visitor_logs)');
-  const hasCfCountry = visitorLogColumns.some((column) => column.name === 'cf_country');
-  if (!hasCfCountry) {
-    await db.exec("ALTER TABLE visitor_logs ADD COLUMN cf_country TEXT NOT NULL DEFAULT ''");
-  }
-  const hasBlocked = visitorLogColumns.some((column) => column.name === 'blocked');
-  if (!hasBlocked) {
-    await db.exec('ALTER TABLE visitor_logs ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0');
-  }
-  const hasBlockReason = visitorLogColumns.some((column) => column.name === 'block_reason');
-  if (!hasBlockReason) {
-    await db.exec("ALTER TABLE visitor_logs ADD COLUMN block_reason TEXT NOT NULL DEFAULT ''");
-  }
-
-  const columns = await db.all<{ name: string }[]>('PRAGMA table_info(accounts)');
-  const hasSortOrder = columns.some((column) => column.name === 'sort_order');
-  if (!hasSortOrder) {
-    await db.exec('ALTER TABLE accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0');
-  }
-  const hasBlacklisted = columns.some((column) => column.name === 'is_blacklisted');
-  if (!hasBlacklisted) {
-    await db.exec('ALTER TABLE accounts ADD COLUMN is_blacklisted INTEGER NOT NULL DEFAULT 0');
-  }
-  const hasDeleted = columns.some((column) => column.name === 'is_deleted');
-  if (!hasDeleted) {
-    await db.exec('ALTER TABLE accounts ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0');
-  }
-  const hasKid = columns.some((column) => column.name === 'kid');
-  if (!hasKid) {
-    await db.exec("ALTER TABLE accounts ADD COLUMN kid TEXT NOT NULL DEFAULT ''");
-  }
-
-  const sortStats = await db.get<{ zeroCount: number; maxSortOrder: number }>(
-    'SELECT COUNT(*) FILTER (WHERE sort_order = 0) as zeroCount, COALESCE(MAX(sort_order), 0) as maxSortOrder FROM accounts'
-  );
-  if ((sortStats?.zeroCount ?? 0) > 0 || (sortStats?.maxSortOrder ?? 0) === 0) {
-    await db.exec(`
-      WITH ordered AS (
-        SELECT account_id, ROW_NUMBER() OVER (ORDER BY created_at ASC, account_id ASC) AS next_sort_order
-        FROM accounts
-      )
-      UPDATE accounts
-      SET sort_order = (
-        SELECT next_sort_order
-        FROM ordered
-        WHERE ordered.account_id = accounts.account_id
-      )
-      WHERE account_id IN (SELECT account_id FROM ordered);
-    `);
-  }
 }
 
 export async function getDb(): Promise<Database<sqlite3.Database, sqlite3.Statement>> {
