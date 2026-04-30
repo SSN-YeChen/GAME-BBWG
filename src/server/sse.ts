@@ -1,15 +1,6 @@
 import type express from 'express';
+import type { AccountImportProgressPayload } from '../services/accountImport.js';
 import type { RedeemProgressPayload } from '../services/redeem.js';
-
-export interface ImportProgressPayload {
-  type: 'start' | 'progress' | 'done';
-  total?: number;
-  processed?: number;
-  inserted?: number;
-  skipped?: number;
-  failed?: number;
-  accountId?: string;
-}
 
 export class SseHub {
   private readonly redeemClients = new Set<express.Response>();
@@ -19,7 +10,7 @@ export class SseHub {
     this.broadcast(this.redeemClients, payload);
   }
 
-  broadcastImportProgress(payload: ImportProgressPayload): void {
+  broadcastImportProgress(payload: AccountImportProgressPayload): void {
     this.broadcast(this.importClients, payload);
   }
 

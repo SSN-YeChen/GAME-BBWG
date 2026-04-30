@@ -1,53 +1,22 @@
-import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   ACCOUNT_STATUS,
-  countAccountsByStatus,
   forceSetAllAccountsRedeemed,
-  listAccounts,
-  listAccountsByIds,
   listAccountsByIdsIncludingDeleted,
-  listAccountsByStatus,
-  resetAccountsStatus,
   updateAccountProfile,
   updateAccountStatus
 } from '../core/db.js';
-import { getRedeemToken } from '../core/config.js';
+import { countRemainingRedeemAccounts, selectRedeemAccounts } from './redeemAccountSelector.js';
+import { isTimeoutRetryMessage, submitLoginRequest, submitRedeemRequest } from './redeemClient.js';
+import type { ApiEnvelope, RedeemProgressPayload, RedeemRunOptions, RedeemSummary } from './redeemTypes.js';
+export type { ApiEnvelope, RedeemProgressPayload, RedeemRunOptions, RedeemSummary } from './redeemTypes.js';
 
-const LOGIN_URL = 'https://giftcode-api.benbenwangguo.cn/api/player';
-const REDEEM_URL = 'https://giftcode-api.benbenwangguo.cn/api/gift_code';
 const REQUEST_DELAY_MS = 1200;
 const LOGIN_TO_REDEEM_DELAY_MS = 200;
 const CHUNK_DELAY_MS = 4000;
 const CHUNK_SIZE = 30;
-const RETRY_AFTER_429_MS = 5000;
 const TIMEOUT_RETRY_DELAY_MS = 2000;
 const MAX_TIMEOUT_RETRY_ATTEMPTS = 2;
-
-export interface RedeemSummary {
-  total: number;
-  processed: number;
-  successCount: number;
-  receivedCount: number;
-  failureCount: number;
-  remaining: number;
-  resetTriggered: boolean;
-}
-
-export interface RedeemProgressPayload {
-  type: 'start' | 'log' | 'progress' | 'done';
-  level?: 'info' | 'warn' | 'error' | 'success';
-  message?: string;
-  processed?: number;
-  total?: number;
-  summary?: RedeemSummary;
-}
-
-export interface ApiEnvelope {
-  code?: number;
-  msg?: string;
-  data?: Record<string, unknown>;
-}
 
 class RedeemCancelledError extends Error {
   constructor() {
@@ -60,75 +29,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-function isTimeoutRetryMessage(message: string): boolean {
-  return message.trim().toUpperCase() === 'TIMEOUT RETRY.';
-}
-
-async function postFormJson(
-  url: string,
-  params: Record<string, string>,
-  timeoutMs: number,
-  activeController: AbortController
-): Promise<Response> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const timeoutController = new AbortController();
-    const onManualAbort = () => timeoutController.abort();
-    const timer = setTimeout(() => timeoutController.abort(), timeoutMs);
-
-    activeController.signal.addEventListener('abort', onManualAbort, { once: true });
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams(params),
-        signal: timeoutController.signal
-      });
-
-      if (response.status === 429 && attempt < 2) {
-        await sleep(RETRY_AFTER_429_MS);
-        continue;
-      }
-
-      return response;
-    } catch (error) {
-      lastError = error;
-      if (attempt < 2) {
-        await sleep(1000);
-      }
-    } finally {
-      clearTimeout(timer);
-      activeController.signal.removeEventListener('abort', onManualAbort);
-    }
-  }
-
-  throw lastError instanceof Error ? lastError : new Error('Request failed');
-}
-
-function normalizeSignValue(value: unknown): string {
-  if (Array.isArray(value) || (typeof value === 'object' && value !== null)) {
-    return JSON.stringify(value);
-  }
-  return String(value);
-}
-
-function buildSignedParams(params: Record<string, string>): Record<string, string> {
-  const redeemToken = getRedeemToken();
-  if (!redeemToken) {
-    throw new Error('缺少兑换 TOKEN，请先在批量兑换页面保存 TOKEN。');
-  }
-
-  const signedParams: Record<string, string> = {
-    ...params,
-    time: Date.now().toString()
-  };
-
-  const sortedEntries = Object.entries(signedParams).sort(([a], [b]) => a.localeCompare(b, 'en'));
-  const payload = sortedEntries.map(([k, v]) => `${k}=${normalizeSignValue(v)}`).join('&');
-  signedParams.sign = crypto.createHash('md5').update(`${payload}${redeemToken}`).digest('hex');
-  return signedParams;
 }
 
 export class RedeemService extends EventEmitter {
@@ -188,22 +88,7 @@ export class RedeemService extends EventEmitter {
       this.ensureNotCancelled();
       this.activeController = new AbortController();
 
-      const redeemResponse = await postFormJson(
-        REDEEM_URL,
-        buildSignedParams({
-          fid: accountId,
-          cdk: giftCode,
-          captcha_code: ''
-        }),
-        15_000,
-        this.activeController
-      );
-
-      if (!redeemResponse.ok) {
-        throw new Error(`HTTP ${redeemResponse.status}`);
-      }
-
-      lastResult = (await redeemResponse.json()) as ApiEnvelope;
+      lastResult = await submitRedeemRequest(accountId, giftCode, this.activeController);
       const message = lastResult.msg ?? '未知错误';
       if (!isTimeoutRetryMessage(message) || attempt === MAX_TIMEOUT_RETRY_ATTEMPTS - 1) {
         return lastResult;
@@ -219,7 +104,7 @@ export class RedeemService extends EventEmitter {
   async runBatchRedeem(
     giftCode: string,
     targetAccountIds?: string[],
-    options?: { includeAllAccounts?: boolean; includeTargetAccounts?: boolean }
+    options?: RedeemRunOptions
   ): Promise<RedeemSummary> {
     if (this.running) {
       throw new Error('当前已有兑换任务正在执行，请稍后再试。');
@@ -241,19 +126,9 @@ export class RedeemService extends EventEmitter {
 
       const includeAllAccounts = options?.includeAllAccounts ?? false;
       const includeTargetAccounts = options?.includeTargetAccounts ?? false;
-      let pendingAccounts = includeAllAccounts
-        ? await listAccounts()
-        : targetAccountIds && targetAccountIds.length > 0
-          ? includeTargetAccounts
-            ? await listAccountsByIds(targetAccountIds)
-            : (await listAccountsByIds(targetAccountIds)).filter((item) => item.status === ACCOUNT_STATUS.failed)
-          : await listAccountsByStatus(ACCOUNT_STATUS.pending);
-
-      if (!includeAllAccounts && (!targetAccountIds || targetAccountIds.length === 0) && pendingAccounts.length === 0) {
-        await resetAccountsStatus(ACCOUNT_STATUS.redeemed, ACCOUNT_STATUS.pending);
-        pendingAccounts = await listAccountsByStatus(ACCOUNT_STATUS.pending);
-        resetTriggered = true;
-      }
+      const selected = await selectRedeemAccounts(targetAccountIds, options);
+      const pendingAccounts = selected.accounts;
+      resetTriggered = selected.resetTriggered;
 
       total = pendingAccounts.length;
       if (total === 0) {
@@ -293,14 +168,7 @@ export class RedeemService extends EventEmitter {
             this.log('info', `开始处理: ${displayName} (${account.accountId})`);
             this.activeController = new AbortController();
 
-            const loginResponse = await postFormJson(
-              LOGIN_URL,
-              buildSignedParams({
-                fid: account.accountId
-              }),
-              10_000,
-              this.activeController
-            );
+            const loginResponse = await submitLoginRequest(account.accountId, this.activeController);
 
             if (!loginResponse.ok) {
               failureCount += 1;
@@ -384,7 +252,7 @@ export class RedeemService extends EventEmitter {
         }
       }
 
-      const remaining = includeAllAccounts || includeTargetAccounts ? 0 : await countAccountsByStatus(ACCOUNT_STATUS.pending);
+      const remaining = includeAllAccounts || includeTargetAccounts ? 0 : await countRemainingRedeemAccounts(options);
       const summary: RedeemSummary = {
         total,
         processed,
@@ -408,8 +276,7 @@ export class RedeemService extends EventEmitter {
       return summary;
     } catch (error) {
       if (error instanceof RedeemCancelledError) {
-        const remaining =
-          options?.includeAllAccounts || options?.includeTargetAccounts ? 0 : await countAccountsByStatus(ACCOUNT_STATUS.pending);
+        const remaining = await countRemainingRedeemAccounts(options);
         const summary: RedeemSummary = {
           total,
           processed,
