@@ -2,16 +2,16 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getDb } from './core/db.js';
+import { getDb } from './core/dbConnection.js';
 import { ActiveRedeemCodeSource } from './sources/activeRedeemCodeSource.js';
 import { AccountImportService } from './services/accountImport.js';
 import { AutoRedeemCoordinator } from './services/autoRedeem.js';
 import { RedeemService } from './services/redeem.js';
 import { AuthService } from './server/auth.js';
-import { createVisitorAuditMiddleware, createVisitorBlacklistMiddleware } from './server/http.js';
 import { startVisitorLogCleanup, VISITOR_LOG_RETENTION_DAYS } from './server/maintenance.js';
 import { registerApiRoutes } from './server/routes.js';
 import { SseHub } from './server/sse.js';
+import { createVisitorAuditMiddleware, createVisitorBlacklistMiddleware } from './server/visitorMiddleware.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();

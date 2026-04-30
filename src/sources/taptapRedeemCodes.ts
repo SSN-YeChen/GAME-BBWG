@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { type RedeemCodeInput, upsertRedeemCodes } from '../core/db.js';
+import type { RedeemCodeInput } from '../core/dbTypes.js';
+import { upsertRedeemCodes } from '../core/redeemCodeRepository.js';
+import { extractRedeemCodes, normalizeWhitespace } from './redeemCodeParser.js';
 
 const TAPTAP_TOPIC_URL = 'https://www.taptap.cn/app/759692/topic?type=official';
 const TAPTAP_FEED_URL = 'https://www.taptap.cn/webapiv2/feed/v7/by-group';
@@ -71,25 +73,6 @@ function buildTapTapFeedUrl(): string {
   url.searchParams.set('status', '0');
   url.searchParams.set('with_hot_comment', 'true');
   return url.toString();
-}
-
-function normalizeWhitespace(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function extractRedeemCodes(...texts: string[]): string[] {
-  const codes = new Set<string>();
-  const sourceText = texts.filter(Boolean).join('\n');
-  const explicitCodePattern = /(?:兑换码|礼包码|CDK|cdk)\s*[：:：\s]\s*([A-Za-z0-9][A-Za-z0-9_-]{2,31})/gu;
-
-  for (const match of sourceText.matchAll(explicitCodePattern)) {
-    const code = match[1]?.replace(/[^A-Za-z0-9_-]/g, '').trim();
-    if (code) {
-      codes.add(code.toUpperCase());
-    }
-  }
-
-  return Array.from(codes);
 }
 
 function toRedeemCodeInputs(item: TapTapFeedItem): RedeemCodeInput[] {

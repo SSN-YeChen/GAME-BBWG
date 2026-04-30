@@ -5,7 +5,7 @@ import {
   listBlacklistedAccounts,
   reorderAccounts,
   setAccountBlacklist
-} from '../../core/db.js';
+} from '../../core/accountRepository.js';
 import { sendJsonError } from '../http.js';
 import type { ApiRouteContext } from './types.js';
 

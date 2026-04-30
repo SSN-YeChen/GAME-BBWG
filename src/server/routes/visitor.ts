@@ -4,7 +4,7 @@ import {
   listBlacklistEntries,
   listVisitorLogs,
   upsertBlacklistEntry
-} from '../../core/db.js';
+} from '../../core/visitorRepository.js';
 import { normalizeIpAddress, sendJsonError } from '../http.js';
 import type { ApiRouteContext } from './types.js';
 

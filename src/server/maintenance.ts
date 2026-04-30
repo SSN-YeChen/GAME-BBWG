@@ -1,4 +1,4 @@
-import { cleanupVisitorLogs } from '../core/db.js';
+import { cleanupVisitorLogs } from '../core/visitorRepository.js';
 
 export const VISITOR_LOG_RETENTION_DAYS = 30;
 

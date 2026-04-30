@@ -1,4 +1,4 @@
-import { listRedeemCodes } from '../../core/db.js';
+import { listRedeemCodes } from '../../core/redeemCodeRepository.js';
 import { sendJsonError } from '../http.js';
 import type { ApiRouteContext } from './types.js';
 

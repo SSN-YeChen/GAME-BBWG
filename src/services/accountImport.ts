@@ -1,4 +1,4 @@
-import { createAccountsBatch, getExistingAccountIds } from '../core/db.js';
+import { createAccountsBatch, getExistingAccountIds } from '../core/accountRepository.js';
 import { fetchPlayerProfile, waitForNextAccount } from './player.js';
 
 export interface AccountImportProgressPayload {

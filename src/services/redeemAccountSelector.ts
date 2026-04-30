@@ -1,12 +1,11 @@
 import {
-  ACCOUNT_STATUS,
   countAccountsByStatus,
   listAccounts,
   listAccountsByIds,
   listAccountsByStatus,
-  resetAccountsStatus,
-  type AccountRow
-} from '../core/db.js';
+  resetAccountsStatus
+} from '../core/accountRepository.js';
+import { ACCOUNT_STATUS, type AccountRow } from '../core/dbTypes.js';
 import type { RedeemRunOptions } from './redeemTypes.js';
 
 export async function selectRedeemAccounts(
